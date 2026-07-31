@@ -109,6 +109,9 @@ default falls short.
 - backslash-based variants, since Windows treats `\` as a separator
 - any entry whose resolved path would land outside the destination
 - entries whose Unix mode marks them a symlink
+- paths that pass through a symlink or junction already in the destination —
+  directories are created one component at a time so none is followed
+- targets that carry other hard links, since writing through one edits them all
 - overwriting an existing file, unless `overwrite: true`
 
 `limits` has safe defaults: `maxEntries`, `maxEntryUncompressedSize`,
