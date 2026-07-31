@@ -4,6 +4,10 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # The >4 GiB path is opt-in, so without this it runs nowhere.
+    - cron: "0 4 * * *"
 
 jobs:
   check:
@@ -51,6 +55,18 @@ jobs:
 
       - run: bun install --frozen-lockfile
       - run: bun test
+
+  large:
+    name: ">4 GiB Zip64"
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run test:large
 
   pack:
     name: package contents

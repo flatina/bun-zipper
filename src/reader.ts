@@ -34,6 +34,11 @@ import { isDirectoryName } from "./path.ts";
 export interface ZipLimits {
   maxEntries?: number;
   maxEntryUncompressedSize?: bigint;
+  /**
+   * Running total across an archive, so many small entries cannot add up past
+   * the per-entry limit. Spent by `unzip` and `extractZip`; a caller iterating
+   * `entries` itself gets the per-entry limits only.
+   */
   maxTotalUncompressedSize?: bigint;
   /** Checked before decompressing, against the declared sizes. */
   maxCompressionRatio?: number;
@@ -76,6 +81,11 @@ export interface ZipReaderOptions {
    * A damaged backup is the case this exists for: `unzip`, 7-Zip and Python all
    * hand back what they could read and report the problem separately, and
    * refusing outright loses data the caller may still want.
+   *
+   * Reaches same-length damage only. Size is checked before the CRC on both
+   * paths, so an entry that reads short throws `ZipFormatError` without ever
+   * calling this. `stream()` is the recovery path there: it delivers the chunks
+   * that arrived and errors at the end.
    *
    * `expected` is the central header's value and `local` the local header's copy,
    * which most writers fill in. Agreement between those two points at the data
