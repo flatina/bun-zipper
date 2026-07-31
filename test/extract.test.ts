@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { link, mkdtemp, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extractZip, MemorySink, ZipSecurityError, ZipWriter, zip } from "../src/index.ts";
@@ -61,6 +61,13 @@ describe("extractZip", () => {
     ).rejects.toThrow(ZipSecurityError);
   });
 
+  test("a directory in the way reports the collision, not a raw fs error", async () => {
+    await extractZip(await zip({ "a/keep.txt": "x" }), dir);
+    await expect(extractZip(await zip({ a: "clobber" }), dir, { overwrite: true })).rejects.toThrow(
+      /exists as a directory/,
+    );
+  });
+
   test("filter skips entries", async () => {
     const archive = await zip({ "keep.txt": "yes", "skip.bin": "no" });
     const written = await extractZip(archive, dir, {
@@ -103,6 +110,61 @@ describe("extractZip rejects hostile archives", () => {
     // 0o120777: S_IFLNK plus permissions, the mode a symlink entry carries.
     const archive = await archiveWithName("link", 0o120777);
     await expect(extractZip(archive, dir)).rejects.toThrow(ZipSecurityError);
+  });
+
+  describe("links already in the destination", () => {
+    let outside = "";
+
+    beforeEach(async () => {
+      outside = await mkdtemp(join(tmpdir(), "bun-zipper-outside-"));
+    });
+
+    afterEach(async () => {
+      await rm(outside, { recursive: true, force: true });
+    });
+
+    // A junction is what Windows can create without privileges; the type
+    // argument is ignored elsewhere, where this is a plain symlink. Both are
+    // what a recursive mkdir would happily follow.
+    const linkTo = (target: string, path: string) => symlink(target, path, "junction");
+
+    test("a directory entry cannot build through a link", async () => {
+      await linkTo(outside, join(dir, "link"));
+      await expect(extractZip(await zip({ "link/newdir/": "" }), dir)).rejects.toThrow(
+        ZipSecurityError,
+      );
+      expect(await readdir(outside)).toEqual([]);
+    });
+
+    test("a file entry cannot build its parents through a link", async () => {
+      await linkTo(outside, join(dir, "link"));
+      await expect(extractZip(await zip({ "link/deep/f.txt": "x" }), dir)).rejects.toThrow(
+        ZipSecurityError,
+      );
+      expect(await readdir(outside)).toEqual([]);
+    });
+
+    test("a hard link to a file outside is refused rather than written through", async () => {
+      // lstat cannot see where the other names for this inode are, and writing
+      // through one edits all of them.
+      const secret = join(outside, "secret.txt");
+      await Bun.write(secret, "original");
+      await link(secret, join(dir, "a.txt"));
+
+      await expect(
+        extractZip(await zip({ "a.txt": "payload" }), dir, { overwrite: true }),
+      ).rejects.toThrow(ZipSecurityError);
+      expect(await Bun.file(secret).text()).toBe("original");
+    });
+
+    test("a linked target path is refused rather than written through", async () => {
+      await linkTo(outside, join(dir, "a"));
+      // overwrite: true, so this is the link check refusing and not the clobber check.
+      await expect(
+        extractZip(await zip({ a: "payload" }), dir, { overwrite: true }),
+      ).rejects.toThrow(ZipSecurityError);
+      expect(await readdir(outside)).toEqual([]);
+    });
   });
 
   test("nothing escaped the destination", async () => {

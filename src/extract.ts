@@ -1,6 +1,6 @@
-import { mkdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { ZipSecurityError } from "./errors.ts";
+import { ZipError, ZipSecurityError } from "./errors.ts";
 import { sanitizeEntryPath } from "./path.ts";
 import {
   TotalSizeBudget,
@@ -54,20 +54,34 @@ export async function extractZip(
       });
     }
 
+    const parts = relative.split("/");
     if (entry.isDirectory) {
-      await mkdir(target, { recursive: true });
+      await mkdirInside(root, parts, entry.name);
       continue;
     }
-    if (!options.overwrite && (await Bun.file(target).exists())) {
+    await mkdirInside(root, parts.slice(0, -1), entry.name);
+
+    // A symlink here would be followed by the write, landing the bytes wherever
+    // it points. `exists()` cannot see a dangling one, so lstat is what decides.
+    const existing = await lstat(target).catch(() => undefined);
+    if (existing?.isSymbolicLink()) {
+      throw new ZipSecurityError("destination path is a symbolic link", { entry: entry.name });
+    }
+    if (existing !== undefined && existing.nlink > 1) {
+      // Writing through a hard link edits every other name for the same file,
+      // and lstat gives no way to tell whether one of them is outside the root.
+      throw new ZipSecurityError("destination path has other hard links", { entry: entry.name });
+    }
+    if (existing?.isDirectory()) {
+      throw new ZipError(`${relative} exists as a directory`, { entry: entry.name });
+    }
+    if (!options.overwrite && existing !== undefined) {
       throw new ZipSecurityError(`refusing to overwrite ${relative}`, { entry: entry.name });
     }
 
-    // Creating the parent ourselves lets us resolve it before writing: a symlink
-    // planted under the destination (by an earlier entry, or already on disk)
-    // would otherwise redirect the write outside it.
-    const parent = dirname(target);
-    await mkdir(parent, { recursive: true });
-    const realParent = await realpath(parent);
+    // Last line of defence: mkdirInside refuses symlinked components, but the
+    // check and the write are not atomic.
+    const realParent = await realpath(dirname(target));
     if (realParent !== root && !realParent.startsWith(root + sep)) {
       throw new ZipSecurityError("entry's parent directory resolves outside the destination", {
         entry: entry.name,
@@ -80,4 +94,30 @@ export async function extractZip(
     written.push(target);
   }
   return written;
+}
+
+/**
+ * Creates the path one component at a time. `mkdir -p` follows a symlink already
+ * on disk and creates directories outside the root, and checking afterwards is
+ * too late — they exist by then. The root itself is exempt: it was resolved once
+ * by the caller, so reaching it through a symlink (macOS `/tmp`) stays legal.
+ */
+async function mkdirInside(root: string, parts: string[], entry: string): Promise<void> {
+  let at = root;
+  for (const part of parts) {
+    at = join(at, part);
+    const info = await lstat(at).catch(() => undefined);
+    if (info === undefined) {
+      await mkdir(at);
+      continue;
+    }
+    if (info.isSymbolicLink()) {
+      throw new ZipSecurityError(`${part} is a symbolic link in the destination`, { entry });
+    }
+    if (!info.isDirectory()) {
+      // A collision, not an attack: an archive can name a file and a directory
+      // the same thing, and a trailing backslash makes one look like the other.
+      throw new ZipError(`${part} exists and is not a directory`, { entry });
+    }
+  }
 }
