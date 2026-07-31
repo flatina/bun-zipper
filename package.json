@@ -1,6 +1,6 @@
 {
   "name": "@flatina/bun-zipper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ZIP container reader/writer for Bun. No bundled compression algorithm — deflate is the runtime's.",
   "type": "module",
   "license": "MIT",
@@ -46,6 +46,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2.5.6",
     "@types/bun": "latest",
+    "fflate": "^0.8.3",
     "typescript": "^5"
   }
 }

@@ -139,10 +139,9 @@ export class ZipWriter {
     this.#names.add(name);
 
     const isDirectory = name.endsWith("/");
-    const method =
-      (options.compression ?? this.#options.compression ?? "deflate") === "store" || isDirectory
-        ? METHOD_STORE
-        : METHOD_DEFLATE;
+    const compression = options.compression ?? this.#options.compression ?? "auto";
+    // A directory entry has no data, so there is nothing to compress.
+    const method = compression === "store" || isDirectory ? METHOD_STORE : METHOD_DEFLATE;
     const level = options.level ?? this.#options.level;
     const { time: dosTime, date: dosDate } = toDosTime(options.modifiedAt ?? new Date());
 
@@ -174,17 +173,31 @@ export class ZipWriter {
     if (data instanceof ReadableStream) {
       await this.#addStreaming(entry, data);
     } else {
-      await this.#addBuffered(entry, await toBytes(data), level);
+      await this.#addBuffered(entry, await toBytes(data), level, compression === "auto");
     }
 
     this.#entries.push(entry);
   }
 
   /** Sizes and CRC are known up front, so no data descriptor is needed. */
-  async #addBuffered(entry: CentralEntry, bytes: Uint8Array, level?: Level): Promise<void> {
+  async #addBuffered(
+    entry: CentralEntry,
+    bytes: Uint8Array,
+    level: Level | undefined,
+    keepOnlyIfSmaller: boolean,
+  ): Promise<void> {
     entry.crc = crc32(bytes);
     entry.uncompressedSize = BigInt(bytes.length);
-    const payload = entry.method === METHOD_DEFLATE ? deflateBytes(bytes, level) : bytes;
+
+    let payload = bytes;
+    if (entry.method === METHOD_DEFLATE) {
+      const deflated = deflateBytes(bytes, level);
+      if (keepOnlyIfSmaller && deflated.length >= bytes.length) {
+        entry.method = METHOD_STORE;
+      } else {
+        payload = deflated;
+      }
+    }
     entry.compressedSize = BigInt(payload.length);
     entry.zip64 ||= zip64Shape(entry).sizes;
 

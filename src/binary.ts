@@ -29,24 +29,30 @@ export class ByteWriter {
     return at;
   }
 
+  // Every writer below takes the offset before touching #view or #buf: a
+  // reallocating #reserve replaces both, and JavaScript evaluates the member
+  // lookup before the argument, so an inlined call would write to the discarded
+  // buffer. It only surfaces once a write crosses the current capacity.
+
   u16(value: number): this {
-    this.#view.setUint16(this.#reserve(2), value, true);
+    const at = this.#reserve(2);
+    this.#view.setUint16(at, value, true);
     return this;
   }
 
   u32(value: number): this {
-    this.#view.setUint32(this.#reserve(4), value >>> 0, true);
+    const at = this.#reserve(4);
+    this.#view.setUint32(at, value >>> 0, true);
     return this;
   }
 
   u64(value: bigint): this {
-    this.#view.setBigUint64(this.#reserve(8), value, true);
+    const at = this.#reserve(8);
+    this.#view.setBigUint64(at, value, true);
     return this;
   }
 
   bytes(data: Uint8Array): this {
-    // #reserve may replace #buf, and the member lookup happens before the
-    // argument is evaluated — so the offset must be taken first.
     const at = this.#reserve(data.length);
     this.#buf.set(data, at);
     return this;
@@ -91,6 +97,7 @@ export class ByteReader {
   }
 
   u8(what = "u8"): number {
+    // Reader side: the buffer is fixed, so there is no reallocation hazard here.
     return this.#view.getUint8(this.#need(1, what));
   }
 

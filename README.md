@@ -89,16 +89,17 @@ Encryption (ZipCrypto, AES), Deflate64, bzip2, LZMA, Zstandard, split and
 multi-disk archives, appending to an existing archive, and repairing damaged
 archives. Each is rejected with a specific error rather than silently mishandled.
 
-## Compression level
+## Compression
 
-`level` is honored only when the input is buffered — a string, `Uint8Array`,
-`ArrayBuffer`, or `Blob` — because that path uses `Bun.deflateSync`, which takes
-a level. `ReadableStream` input goes through `CompressionStream`, which has no
-level parameter and behaves as level 6. Passing a level with a stream input does
-nothing.
+`compression` defaults to `"auto"`: deflate, and keep the result only if it came
+out smaller. Already-compressed data ends up stored, which is smaller and far
+cheaper to read back. `"deflate"` and `"store"` force the choice.
 
-Higher is not reliably smaller — on Bun 1.3.14, level 9 beat level 6 on some
-inputs and lost on others. Measure rather than assume.
+`level` applies to buffered input only. `ReadableStream` goes through
+`CompressionStream`, which takes no level and behaves as level 6.
+
+Higher is not reliably smaller — see [Performance](#performance) for where the
+default falls short.
 
 ## Security model
 
@@ -110,18 +111,40 @@ inputs and lost on others. Measure rather than assume.
 - entries whose Unix mode marks them a symlink
 - overwriting an existing file, unless `overwrite: true`
 
-Limits apply with safe defaults, tunable through `limits`: `maxEntries`,
-`maxEntryUncompressedSize`, `maxTotalUncompressedSize`, and
-`maxCompressionRatio`. The cumulative one is enforced by `unzip` and
-`extractZip`, since per-entry caps alone cannot stop an archive that stays under
-them across many entries. CRC and size mismatches always throw.
+`limits` has safe defaults: `maxEntries`, `maxEntryUncompressedSize`,
+`maxTotalUncompressedSize`, `maxCompressionRatio`. `unzip` and `extractZip`
+additionally enforce the cumulative one — per-entry caps cannot stop an archive
+that stays under them across many entries. A size mismatch always throws; a CRC
+mismatch throws unless `onCrcMismatch` says otherwise.
 
 `extractZip` is not atomic: when it rejects partway through, files written before
 that point stay on disk. Extract to a scratch directory if you need all-or-nothing.
 
+`maxInflateBuffer` caps what one inflate call may allocate; larger entries
+stream instead. Lowering `maxEntryUncompressedSize` tightens it too, and `-1`
+removes it.
+
 Errors are `ZipFormatError`, `ZipUnsupportedError`, `ZipSecurityError`, and
 `ZipCrcError`, all extending `ZipError`, and carry the entry name and byte offset
 where known.
+
+A CRC mismatch throws by default. `onCrcMismatch` overrides that per entry:
+
+```ts
+// Salvage what a damaged backup still holds, rather than losing all of it.
+const files = await unzip(Bun.file("damaged.zip"), {
+  onCrcMismatch: ({ entry, computed, expected, local }) => {
+    console.warn(`${entry}: CRC ${computed.toString(16)} != ${expected.toString(16)}`);
+    return "accept";
+  },
+});
+```
+
+`expected` is the central header's CRC and `local` the local header's copy. When
+they agree the damage is in the data; when they disagree one of the headers is
+the corrupt part.
+
+`verifyCrc: false` skips the check entirely, so corruption arrives silently.
 
 ## Filenames
 
@@ -166,8 +189,7 @@ Awkward real-world archives that work anyway:
 
 ## Size
 
-Measured with `bun build --minify` and `gzip -9`, tree-shaken per entry point.
-fflate is built from source the same way, so the two columns are comparable.
+Minified and gzipped, tree-shaken per entry point; fflate built the same way.
 
 | You import | bun-zipper | fflate |
 |---|---|---|
@@ -176,13 +198,39 @@ fflate is built from source the same way, so the two columns are comparable.
 | streaming both ways | **8.0 kB** | 7.7 kB (`Zip`/`Unzip`) |
 | everything | **8.0 kB** | 12.6 kB |
 
-Shipping no DEFLATE halves the cost of creating archives. Reading barely gains,
-which answers "why is it this big without an algorithm": Zip64, prepended and
-appended data, three filename-encoding paths, decompression limits, and per-entry
-CRC and size verification cost about what an INFLATE implementation costs. It is
-logic rather than tables — deleting the CP437 table saves 44 bytes gzipped.
+Shipping no DEFLATE halves the cost of creating archives. Reading barely gains:
+Zip64, prepended and appended data, three filename-encoding paths, decompression
+limits, and per-entry verification cost about what an INFLATE implementation does.
 
-Import narrowly if size decides it: `zip` alone is 2.9 kB.
+## Performance
+
+Median of 15 runs on a Ryzen 7 9800X3D, Bun 1.3.14, over the datasets fflate
+benchmarks against. Reproduce with `bun run bench/bench.ts`.
+
+| dataset | create | read | archive size |
+|---|---|---|---|
+| Moby Dick, 1.2 MiB text | 2.2× | 6.7× | 1.6% smaller |
+| Rainier.bmp, 5.9 MiB | 2.0× | 7.5× | 6.5% larger |
+| Maltese.bmp, 15.7 MiB | 2.4× | 7.2× | 14.6% larger |
+| truck.3mf, already compressed | 1.4× | 5.8× | 0.3% larger |
+| 10 MB incompressible | 1.3× | 1.5× | same |
+
+fflate's `unzipSync` does not verify CRC-32, so the read column uses
+`verifyCrc: false` to compare the same work. Leaving the check on costs nothing
+measurable on compressed entries, where inflate dominates, and takes a stored
+10 MB entry from 0.4 ms to 1.3 ms.
+
+Bitmap images are the weak spot: Bun's zlib at its default level lands 14.6%
+behind fflate on Maltese.bmp. `level: 9` ends up 0.1% ahead of it, in 265 ms
+against fflate's 343 ms.
+
+`maxInflateBuffer` decides whether a compressed entry is inflated in one call or
+streamed:
+
+| dataset | `-1` (one call) | `0` (always stream) | default |
+|---|---|---|---|
+| Moby Dick | 1.8 ms | 3.8 ms | 1.5 ms |
+| Maltese.bmp | 23.0 ms | 51.4 ms | 23.3 ms |
 
 ## License
 

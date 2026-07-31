@@ -1,5 +1,10 @@
 import { ByteReader, toSafeInt } from "./binary.ts";
-import { inflateCapped, inflateTransform } from "./compress.ts";
+import {
+  inflateBytes,
+  inflateCapped,
+  inflateTransform,
+  worstCaseInflatedSize,
+} from "./compress.ts";
 import { decodeName } from "./cp437.ts";
 import { Crc32, crc32 } from "./crc32.ts";
 import { ZipCrcError, ZipFormatError, ZipSecurityError, ZipUnsupportedError } from "./errors.ts";
@@ -41,10 +46,62 @@ export interface ZipReaderOptions {
    */
   filenameEncoding?: string;
   limits?: ZipLimits;
+  /**
+   * Bytes `bytes()` may allocate for a single inflate call. An entry is inflated
+   * in one call when it fits, which is several times faster; anything larger is
+   * streamed, holding peak memory near the chunk size instead.
+   *
+   * The check runs *before* inflating, against the largest output the compressed
+   * bytes could possibly produce — `Bun.inflateSync` has no output ceiling, so
+   * there is nothing to stop once it has started.
+   *
+   * `-1` removes the cap: every entry is inflated in one call, and a header that
+   * under-reports its size can allocate whatever its payload dictates. `0`
+   * streams everything. `stream()` always streams regardless.
+   */
+  maxInflateBuffer?: number;
+  /**
+   * Verify each entry's CRC-32 against the archive on read. On by default.
+   *
+   * Turning it off makes a stored entry roughly a copy, which is what readers
+   * that skip the check are doing when they look faster. Corruption then reaches
+   * the caller silently: the size check still runs, but a flipped byte does not
+   * change the size. Only worth it for data you have already validated.
+   */
+  verifyCrc?: boolean;
+  /**
+   * Called instead of throwing when an entry's CRC-32 does not match. Return
+   * `"accept"` to take the bytes anyway.
+   *
+   * A damaged backup is the case this exists for: `unzip`, 7-Zip and Python all
+   * hand back what they could read and report the problem separately, and
+   * refusing outright loses data the caller may still want.
+   *
+   * `expected` is the central header's value and `local` the local header's copy,
+   * which most writers fill in. Agreement between those two points at the data
+   * being damaged; disagreement points at one of the headers.
+   */
+  onCrcMismatch?: (info: CrcMismatch) => "throw" | "accept";
+}
+
+export interface CrcMismatch {
+  entry: string;
+  computed: number;
+  expected: number;
+  /** Absent for entries written with a data descriptor. */
+  local: number | undefined;
+  /** The recovered bytes. Absent when streaming, where they are already delivered. */
+  data: Uint8Array | undefined;
 }
 
 /** Slice size for streamed reads; trades syscalls against peak memory. */
 const READ_CHUNK = 1024 * 1024;
+
+/**
+ * Chosen so entries that realistically fit in memory still take the fast path:
+ * the worst-case bound is ~1032x, so this admits roughly 8 MB of compressed data.
+ */
+const DEFAULT_INFLATE_BUFFER = 2 ** 33;
 
 const DEFAULT_LIMITS: Required<ZipLimits> = {
   maxEntries: 100_000,
@@ -57,6 +114,12 @@ const DEFAULT_LIMITS: Required<ZipLimits> = {
 interface Source {
   readonly size: number;
   read(start: number, length: number): Promise<Uint8Array>;
+  /**
+   * Whether `read` hands back memory the caller may keep. False for an in-memory
+   * archive, where reads are views into the caller's own buffer and returning one
+   * would alias it; true for a Blob, which allocates per read.
+   */
+  readonly ownsReads: boolean;
 }
 
 export type ZipInput = Uint8Array | ArrayBuffer | Blob;
@@ -71,6 +134,7 @@ function toSource(input: ZipInput): Source {
   if (bytes) {
     return {
       size: bytes.length,
+      ownsReads: false,
       async read(start, length) {
         return bytes.subarray(start, start + length);
       },
@@ -81,6 +145,7 @@ function toSource(input: ZipInput): Source {
   };
   return {
     size: blob.size,
+    ownsReads: true,
     async read(start, length) {
       return new Uint8Array(await blob.slice(start, start + length).arrayBuffer());
     },
@@ -144,7 +209,13 @@ export class ZipReader {
     const eocd = await findEndOfCentralDirectory(source);
     const directory = await readCentralDirectory(source, eocd, options, limits);
     return new ZipReader(
-      directory.map((record) => makeEntry(source, record, limits)),
+      directory.map((record) =>
+        makeEntry(source, record, limits, {
+          maxInflateBuffer: options.maxInflateBuffer ?? DEFAULT_INFLATE_BUFFER,
+          verifyCrc: options.verifyCrc ?? true,
+          onCrcMismatch: options.onCrcMismatch,
+        }),
+      ),
       eocd.comment,
       limits,
     );
@@ -501,7 +572,20 @@ function parseExtra(
   return out;
 }
 
-function makeEntry(source: Source, record: CentralRecord, limits: Required<ZipLimits>): ZipEntry {
+function makeEntry(
+  source: Source,
+  record: CentralRecord,
+  limits: Required<ZipLimits>,
+  {
+    maxInflateBuffer,
+    verifyCrc,
+    onCrcMismatch,
+  }: {
+    maxInflateBuffer: number;
+    verifyCrc: boolean;
+    onCrcMismatch?: (info: CrcMismatch) => "throw" | "accept";
+  },
+): ZipEntry {
   const isDirectory = isDirectoryName(record.name);
 
   const checkReadable = (): void => {
@@ -533,8 +617,8 @@ function makeEntry(source: Source, record: CentralRecord, limits: Required<ZipLi
     }
   };
 
-  const locateData = async (): Promise<{ start: number; length: number }> => {
-    const start = await findDataStart(source, record);
+  const locateData = async (): Promise<{ start: number; length: number; localCrc?: number }> => {
+    const { start, localCrc } = await findDataStart(source, record);
     const length = toSafeInt(record.compressedSize, "compressed size");
     if (start + length > source.size) {
       throw new ZipFormatError("entry data extends past end of file", {
@@ -542,7 +626,7 @@ function makeEntry(source: Source, record: CentralRecord, limits: Required<ZipLi
         offset: start,
       });
     }
-    return { start, length };
+    return { start, length, localCrc };
   };
 
   const readCompressed = async (): Promise<Uint8Array> => {
@@ -580,25 +664,42 @@ function makeEntry(source: Source, record: CentralRecord, limits: Required<ZipLi
       if (isDirectory) return new Uint8Array(0);
       checkReadable();
       const compressed = await readCompressed();
+      // Stop at whichever ceiling comes first; a header that under-reports its
+      // size must not be able to expand past the configured limit.
+      const cap =
+        record.uncompressedSize < limits.maxEntryUncompressedSize
+          ? record.uncompressedSize
+          : limits.maxEntryUncompressedSize;
+
+      // Composed with the entry limit, so tightening that for safety cannot
+      // silently cost the memory bound. Only -1 opts out entirely.
+      const ceiling =
+        BigInt(maxInflateBuffer) < limits.maxEntryUncompressedSize
+          ? BigInt(maxInflateBuffer)
+          : limits.maxEntryUncompressedSize;
+      const buffered =
+        maxInflateBuffer < 0 || worstCaseInflatedSize(record.compressedSize) <= ceiling;
+
       const out =
         record.method === METHOD_STORE
-          ? // Copy: the source may be the caller's own buffer, and a view would
-            // both alias it and pin the whole archive in memory.
-            compressed.slice()
-          : await inflateCapped(
-              compressed,
-              // Stop at whichever ceiling comes first; a header that under-reports
-              // its size must not be able to expand past the configured limit.
-              record.uncompressedSize < limits.maxEntryUncompressedSize
-                ? record.uncompressedSize
-                : limits.maxEntryUncompressedSize,
-              () =>
-                new ZipSecurityError(
-                  `entry inflates past its declared size of ${record.uncompressedSize} bytes`,
-                  { entry: record.name },
-                ),
-              record.name,
-            );
+          ? // A view into the caller's own archive would alias it and pin the
+            // whole buffer. A Blob read already allocated, so it can be handed on.
+            source.ownsReads
+            ? compressed
+            : compressed.slice()
+          : buffered
+            ? inflateBytes(compressed, record.name)
+            : await inflateCapped(
+                compressed,
+                cap,
+                () =>
+                  new ZipSecurityError(
+                    `entry inflates past its declared size of ${record.uncompressedSize} bytes`,
+                    { entry: record.name },
+                  ),
+                record.name,
+                record.uncompressedSize,
+              );
 
       if (BigInt(out.length) !== record.uncompressedSize) {
         throw new ZipFormatError(
@@ -606,12 +707,23 @@ function makeEntry(source: Source, record: CentralRecord, limits: Required<ZipLi
           { entry: record.name },
         );
       }
-      const actual = new Crc32().update(out).value;
-      if (actual !== record.crc32) {
-        throw new ZipCrcError(
-          `CRC-32 mismatch: expected ${record.crc32.toString(16)}, got ${actual.toString(16)}`,
-          { entry: record.name },
-        );
+      if (verifyCrc) {
+        const actual = new Crc32().update(out).value;
+        if (actual !== record.crc32) {
+          const verdict = onCrcMismatch?.({
+            entry: record.name,
+            computed: actual,
+            expected: record.crc32,
+            local: (await locateData()).localCrc,
+            data: out,
+          });
+          if (verdict !== "accept") {
+            throw new ZipCrcError(
+              `CRC-32 mismatch: expected ${record.crc32.toString(16)}, got ${actual.toString(16)}`,
+              { entry: record.name },
+            );
+          }
+        }
       }
       return out;
     },
@@ -625,7 +737,7 @@ function makeEntry(source: Source, record: CentralRecord, limits: Required<ZipLi
       checkReadable();
       const raw = await compressedStream();
       const plain = record.method === METHOD_STORE ? raw : raw.pipeThrough(inflateTransform());
-      return plain.pipeThrough(verifyTransform(record));
+      return plain.pipeThrough(verifyTransform(record, verifyCrc, onCrcMismatch));
     },
   };
   return entry;
@@ -635,7 +747,10 @@ function makeEntry(source: Source, record: CentralRecord, limits: Required<ZipLi
  * Local header name/extra lengths can differ from the central copy, so the data
  * offset has to come from the local header itself.
  */
-async function findDataStart(source: Source, record: CentralRecord): Promise<number> {
+async function findDataStart(
+  source: Source,
+  record: CentralRecord,
+): Promise<{ start: number; localCrc: number | undefined }> {
   const localOffset = toSafeInt(record.localOffset, "local header offset");
   if (localOffset + LOCAL_HEADER_SIZE > source.size) {
     throw new ZipFormatError("local header offset is out of range", {
@@ -660,20 +775,29 @@ async function findDataStart(source: Source, record: CentralRecord): Promise<num
     );
   }
   r.skip(4, "modification time");
-  r.skip(4, "crc-32");
+  // Zero here means the real value rides in the data descriptor, not that the
+  // entry has no checksum.
+  const localCrc = r.u32("crc-32") >>> 0;
   r.skip(4, "compressed size");
   r.skip(4, "uncompressed size");
   const nameLength = r.u16("file name length");
   const extraLength = r.u16("extra field length");
-  return localOffset + LOCAL_HEADER_SIZE + nameLength + extraLength;
+  return {
+    start: localOffset + LOCAL_HEADER_SIZE + nameLength + extraLength,
+    localCrc: localCrc === 0 ? undefined : localCrc,
+  };
 }
 
-function verifyTransform(record: CentralRecord): TransformStream<Uint8Array, Uint8Array> {
+function verifyTransform(
+  record: CentralRecord,
+  verifyCrc: boolean,
+  onCrcMismatch?: (info: CrcMismatch) => "throw" | "accept",
+): TransformStream<Uint8Array, Uint8Array> {
   const crc = new Crc32();
   let total = 0n;
   return new TransformStream({
     transform(chunk, controller) {
-      crc.update(chunk);
+      if (verifyCrc) crc.update(chunk);
       total += BigInt(chunk.length);
       controller.enqueue(chunk);
     },
@@ -687,7 +811,15 @@ function verifyTransform(record: CentralRecord): TransformStream<Uint8Array, Uin
         );
         return;
       }
-      if (crc.value !== record.crc32) {
+      if (verifyCrc && crc.value !== record.crc32) {
+        const verdict = onCrcMismatch?.({
+          entry: record.name,
+          computed: crc.value,
+          expected: record.crc32,
+          local: undefined,
+          data: undefined,
+        });
+        if (verdict === "accept") return;
         controller.error(
           new ZipCrcError(
             `CRC-32 mismatch: expected ${record.crc32.toString(16)}, got ${crc.value.toString(16)}`,

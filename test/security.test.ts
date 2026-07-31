@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  extractZip,
   sanitizeEntryPath,
   unzip,
   ZipCrcError,
@@ -114,6 +118,56 @@ describe("corrupt archives", () => {
     await expect(reader.entries[0]!.bytes()).rejects.toThrow(ZipCrcError);
   });
 
+  test("a CRC that disagrees with intact data is still a mismatch", async () => {
+    // The other direction: the bytes are fine and the header lies about them.
+    const archive = (await zip({ "a.txt": "hello world" })).slice();
+    const view = new DataView(archive.buffer);
+    view.setUint32(findCentral(archive) + 16, 0xdeadbeef, true);
+    const reader = await ZipReader.open(archive);
+    await expect(reader.entries[0]!.bytes()).rejects.toThrow(ZipCrcError);
+  });
+
+  test("a corrupt deflate payload fails rather than returning short", async () => {
+    const archive = (await zip({ "a.txt": "hello world ".repeat(500) })).slice();
+    const local = findSignature(archive, 0x04034b50);
+    const view = new DataView(archive.buffer);
+    const dataStart =
+      local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
+    // Mid-stream, so the decompressor gets far enough to produce output first.
+    archive[dataStart + 20] = archive[dataStart + 20]! ^ 0xff;
+
+    const reader = await ZipReader.open(archive);
+    await expect(reader.entries[0]!.bytes()).rejects.toThrow();
+  });
+
+  test("streamed reads fail on a bad CRC too", async () => {
+    // stream() checks at flush, a different path from bytes().
+    const archive = (await zip({ "a.txt": { data: "hello world", compression: "store" } })).slice();
+    archive[40] = archive[40]! ^ 0xff;
+    const reader = await ZipReader.open(archive);
+
+    const source = await reader.entries[0]!.stream();
+    await expect(
+      (async () => {
+        for await (const _ of source as unknown as AsyncIterable<Uint8Array>) {
+          // drain
+        }
+      })(),
+    ).rejects.toThrow(ZipCrcError);
+  });
+
+  test("extraction leaves nothing behind when the CRC fails", async () => {
+    const archive = (await zip({ "a.txt": { data: "hello world", compression: "store" } })).slice();
+    archive[40] = archive[40]! ^ 0xff;
+    const dir = await mkdtemp(join(tmpdir(), "bun-zipper-crc-"));
+    try {
+      await expect(extractZip(archive, dir)).rejects.toThrow(ZipCrcError);
+      expect(await readdir(dir)).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a comment containing an EOCD signature does not fool the scan", async () => {
     const archive = await zip({ "a.txt": "hello" }, { comment: "PK\x05\x06 trailing junk" });
     const reader = await ZipReader.open(archive);
@@ -144,6 +198,19 @@ describe("unsupported features", () => {
     await expect(reader.entries[0]!.bytes()).rejects.toThrow(ZipUnsupportedError);
   });
 });
+
+/** Offset of the first central directory header. */
+function findCentral(archive: Uint8Array): number {
+  return findSignature(archive, 0x02014b50);
+}
+
+function findSignature(archive: Uint8Array, signature: number): number {
+  const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+  for (let i = 0; i + 4 <= archive.length; i++) {
+    if (view.getUint32(i, true) === signature) return i;
+  }
+  throw new Error("signature not found");
+}
 
 /** Offset of the flags field in the first central directory header. */
 function findCentralFlagOffset(archive: Uint8Array): number {
