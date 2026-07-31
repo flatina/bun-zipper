@@ -67,13 +67,15 @@ export async function extractZip(
     if (existing?.isSymbolicLink()) {
       throw new ZipSecurityError("destination path is a symbolic link", { entry: entry.name });
     }
-    if (existing !== undefined && existing.nlink > 1) {
-      // Writing through a hard link edits every other name for the same file,
-      // and lstat gives no way to tell whether one of them is outside the root.
-      throw new ZipSecurityError("destination path has other hard links", { entry: entry.name });
-    }
     if (existing?.isDirectory()) {
       throw new ZipError(`${relative} exists as a directory`, { entry: entry.name });
+    }
+    // Regular files only: POSIX counts "." and each subdirectory as links, so
+    // every directory has an nlink above 1 and would look like a hard link.
+    if (existing?.isFile() && existing.nlink > 1) {
+      // Writing through one edits every other name for the same file, and lstat
+      // gives no way to tell whether one of them is outside the root.
+      throw new ZipSecurityError("destination path has other hard links", { entry: entry.name });
     }
     if (!options.overwrite && existing !== undefined) {
       throw new ZipSecurityError(`refusing to overwrite ${relative}`, { entry: entry.name });

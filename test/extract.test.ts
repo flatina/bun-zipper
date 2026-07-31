@@ -62,7 +62,9 @@ describe("extractZip", () => {
   });
 
   test("a directory in the way reports the collision, not a raw fs error", async () => {
-    await extractZip(await zip({ "a/keep.txt": "x" }), dir);
+    // The subdirectory pushes the parent's POSIX link count to 3, which is what
+    // made the hard-link check fire here instead of the collision one.
+    await extractZip(await zip({ "a/keep.txt": "x", "a/sub/deep.txt": "y" }), dir);
     await expect(extractZip(await zip({ a: "clobber" }), dir, { overwrite: true })).rejects.toThrow(
       /exists as a directory/,
     );
