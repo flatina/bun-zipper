@@ -69,5 +69,5 @@ function checkWindowsHazards(part: string, name: string): void {
 
 /** Directory entries are identified solely by a trailing slash (APPNOTE §4.4.17.1). */
 export function isDirectoryName(name: string): boolean {
-  return name.endsWith("/") || name.endsWith("\\");
+  return name.endsWith("/");
 }

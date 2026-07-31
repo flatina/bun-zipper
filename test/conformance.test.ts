@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { unzip, ZipFormatError, ZipReader, ZipUnsupportedError } from "../src/index.ts";
+import { unzip, ZipFormatError, ZipReader, ZipUnsupportedError, zip } from "../src/index.ts";
 
 /**
  * Archives from other implementations' conformance corpora. Everything here is
@@ -122,6 +122,14 @@ describe("adversarial cases from yauzl", () => {
   test("a backslash in a name is not a path separator on read", async () => {
     const reader = await ZipReader.open(yauzl("sloppy-filenames.zip"));
     expect(reader.entries.map((e) => e.name)).toContain("a\\txt");
+  });
+
+  test("nor does a trailing one make the entry a directory", async () => {
+    // Same rule at the end of the name. Reading it as a directory marker
+    // returned empty bytes for a file that had content.
+    const reader = await ZipReader.open(await zip({ "a\\": "payload" }));
+    expect(reader.entries[0]!.isDirectory).toBe(false);
+    expect(await reader.entries[0]!.text()).toBe("payload");
   });
 
   test("traditional encryption is refused", async () => {
