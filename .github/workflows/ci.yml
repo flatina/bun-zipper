@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  check:
+    name: lint + typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+      - run: bun run typecheck
+
+  test:
+    name: test ${{ matrix.os }} / bun ${{ matrix.bun }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # The floor is what package.json declares; latest catches upstream drift.
+        bun: ["1.3.6", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The interop suite skips loudly when a tool is missing, so install them
+      # rather than let a green run hide untested interoperability.
+      - name: Install verification tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y unzip zip p7zip-full ugrep
+
+      - name: Install verification tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install p7zip ugrep
+
+      - name: Install verification tools (Windows)
+        if: runner.os == 'Windows'
+        run: choco install -y --no-progress 7zip unzip zip ugrep
+
+      - uses: astral-sh/setup-uv@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+
+      - run: bun install --frozen-lockfile
+      - run: bun test
+
+  pack:
+    name: package contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Pack and check nothing extraneous ships
+        run: |
+          bun pm pack --destination /tmp
+          tar -tzf /tmp/*.tgz | sort | tee /tmp/contents.txt
+          # Tests, fixtures and vendored corpora must stay out of the tarball.
+          if grep -qE 'package/(test|bench|\.github)/' /tmp/contents.txt; then
+            echo "::error::test or fixture files leaked into the package"
+            exit 1
+          fi

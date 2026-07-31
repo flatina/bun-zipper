@@ -1,0 +1,8 @@
+ZIP test archives from the Go standard library.
+
+    Project:  The Go Programming Language
+    Source:   https://github.com/golang/go
+    Path:     src/archive/zip/testdata
+    License:  BSD-3-Clause (see LICENSE in this directory)
+
+Only the .zip data files were copied. No Go source or test code was taken.

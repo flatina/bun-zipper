@@ -1,0 +1,8 @@
+ZIP test archives from yauzl.
+
+    Project:  yauzl
+    Source:   https://github.com/thejoshwolfe/yauzl
+    Path:     test/success
+    License:  MIT (see LICENSE in this directory)
+
+Only the .zip data files were copied. No JavaScript source or test code was taken.

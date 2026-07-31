@@ -1,0 +1,2 @@
+# Third-party material: keep upstream bytes exactly, no line-ending rewriting.
+* -text
