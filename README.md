@@ -192,16 +192,17 @@ Awkward real-world archives that work anyway:
 
 ## Size
 
-Minified and gzipped, tree-shaken per entry point; fflate built the same way.
+Minified and gzipped, tree-shaken per entry point; fflate built from source the
+same way. `bun run bench/size.ts` regenerates this table.
 
 | You import | bun-zipper | fflate |
 |---|---|---|
-| create only | **2.9 kB** | 5.3 kB (`zipSync`) |
-| read only | **5.1 kB** | 5.8 kB (`unzipSync`) |
-| streaming both ways | **8.0 kB** | 7.7 kB (`Zip`/`Unzip`) |
-| everything | **8.0 kB** | 12.6 kB |
+| create only | **3.3 kB** | 5.3 kB (`zipSync`) |
+| read only | **5.5 kB** | 5.8 kB (`unzipSync`) |
+| streaming both ways | **7.4 kB** | 7.8 kB (`Zip`/`Unzip` plus their entry classes) |
+| everything | **8.8 kB** | 12.5 kB |
 
-Shipping no DEFLATE halves the cost of creating archives. Reading barely gains:
+Shipping no DEFLATE cuts the cost of creating archives by a third. Reading barely gains:
 Zip64, prepended and appended data, three filename-encoding paths, decompression
 limits, and per-entry verification cost about what an INFLATE implementation does.
 

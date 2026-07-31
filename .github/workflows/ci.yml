@@ -21,6 +21,9 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run lint
       - run: bun run typecheck
+      # Without fflate's source the comparison column is skipped; the ceiling on
+      # this package's own bundle is what has to hold.
+      - run: bun run bench/size.ts --check
 
   test:
     name: test ${{ matrix.os }} / bun ${{ matrix.bun }}
