@@ -95,6 +95,11 @@ export class ZipWriter {
   #names = new Set<string>();
   #offset = 0n;
   #closed = false;
+  #released = false;
+  /** Boxed so a failure whose cause is `undefined` is still a failure. */
+  #failure: { cause: unknown } | undefined;
+  /** Counts attempted writes, which is what separates "nothing was emitted" from "something was". */
+  #writes = 0;
   /** Serializes add()/close() so interleaved calls cannot corrupt offsets. */
   #tail: Promise<unknown> = Promise.resolve();
 
@@ -117,6 +122,11 @@ export class ZipWriter {
     );
   }
 
+  /**
+   * Writes the central directory and ends the sink. Safe to call from a
+   * `finally`: after a failed `add()` it still releases the sink, then throws
+   * instead of finishing an archive that would silently omit that entry.
+   */
   close(): Promise<void> {
     return this.#enqueue(() => this.#close());
   }
@@ -129,13 +139,39 @@ export class ZipWriter {
   }
 
   async #write(chunk: Uint8Array): Promise<void> {
+    // Counted before the await: a sink that throws mid-write has still been
+    // given bytes, and the archive is no longer finishable either way.
+    this.#writes++;
     await this.#sink.write(chunk);
     this.#offset += BigInt(chunk.length);
   }
 
+  /** Ends the sink once. On Windows an open FileSink keeps the file locked. */
+  async #release(): Promise<void> {
+    if (this.#released) return;
+    this.#released = true;
+    await Promise.resolve(this.#sink.end()).catch(() => {});
+  }
+
   async #add(name: string, data: EntryData, options: AddOptions): Promise<void> {
+    if (this.#failure !== undefined) {
+      throw new ZipError("writer failed earlier and cannot take more entries", {
+        entry: name,
+        cause: this.#failure.cause,
+      });
+    }
     if (this.#closed) throw new ZipError("writer is closed", { entry: name });
     if (this.#names.has(name)) throw new ZipError(`duplicate entry name: ${name}`, { entry: name });
+
+    // UTF-8 with bit 11 always set, so non-ASCII names survive regardless of the
+    // reader's locale. Encoded before the name is claimed, so a rejected entry
+    // can be retried without tripping the duplicate check.
+    const nameBytes = fieldBytes(utf8.encode(name), "entry name", name);
+    const commentBytes = fieldBytes(
+      options.comment ? utf8.encode(options.comment) : new Uint8Array(0),
+      "entry comment",
+      name,
+    );
     this.#names.add(name);
 
     const isDirectory = name.endsWith("/");
@@ -145,10 +181,6 @@ export class ZipWriter {
     const level = options.level ?? this.#options.level;
     const { time: dosTime, date: dosDate } = toDosTime(options.modifiedAt ?? new Date());
 
-    // Names are always written as UTF-8 with the flag set, so non-ASCII names
-    // survive regardless of the reader's locale.
-    const nameBytes = utf8.encode(name);
-    const commentBytes = options.comment ? utf8.encode(options.comment) : new Uint8Array(0);
     const localOffset = this.#offset;
 
     const unixMode = options.unixMode ?? (isDirectory ? 0o755 : 0o644);
@@ -170,10 +202,21 @@ export class ZipWriter {
       zip64: options.zip64 ?? this.#options.zip64 ?? false,
     };
 
-    if (data instanceof ReadableStream) {
-      await this.#addStreaming(entry, data);
-    } else {
-      await this.#addBuffered(entry, await toBytes(data), level, compression === "auto");
+    const payload = data instanceof ReadableStream ? data : await toBytes(data);
+    const before = this.#writes;
+    try {
+      if (payload instanceof ReadableStream) {
+        await this.#addStreaming(entry, payload);
+      } else {
+        await this.#addBuffered(entry, payload, level, compression === "auto");
+      }
+    } catch (error) {
+      // Only once bytes were offered: a local header on the wire with no central
+      // record is an entry that vanishes without any tool reporting it. Failing
+      // before that — an unrepresentable date, a source that would not read —
+      // leaves the archive finishable, so earlier entries are not lost with it.
+      if (this.#writes !== before) this.#failure = { cause: error };
+      throw error;
     }
 
     this.#entries.push(entry);
@@ -240,11 +283,17 @@ export class ZipWriter {
         for await (const chunk of source as AsyncIterable<Uint8Array>) {
           crc.update(chunk);
           uncompressed += BigInt(chunk.length);
-          await input.write(chunk);
+          // Raced against the drain, which can only settle early by failing. A
+          // sink that throws stops anything reading the compressor, and this
+          // write would then wait on backpressure that never lifts.
+          await Promise.race([input.write(chunk), drain]);
         }
         await input.close();
       } catch (error) {
         await input.abort(error).catch(() => {});
+        // The drain task outlives the abort; unawaited, its rejection surfaces
+        // as an unhandled one after this throw.
+        await drain.catch(() => {});
         throw error;
       }
       await drain;
@@ -268,26 +317,59 @@ export class ZipWriter {
   }
 
   async #close(): Promise<void> {
+    if (this.#failure !== undefined) {
+      await this.#release();
+      throw new ZipError("writer failed earlier; the archive was not finished", {
+        cause: this.#failure.cause,
+      });
+    }
     if (this.#closed) return;
+
+    // Validated before the writer commits to closing, so an oversized comment
+    // leaves it exactly as it was rather than half-finished.
+    const comment = fieldBytes(
+      this.#options.comment ? utf8.encode(this.#options.comment) : new Uint8Array(0),
+      "archive comment",
+    );
     this.#closed = true;
 
-    const centralOffset = this.#offset;
-    for (const entry of this.#entries) await this.#write(centralHeader(entry));
-    const centralSize = this.#offset - centralOffset;
+    try {
+      const centralOffset = this.#offset;
+      for (const entry of this.#entries) await this.#write(centralHeader(entry));
+      const centralSize = this.#offset - centralOffset;
 
-    const comment = this.#options.comment ? utf8.encode(this.#options.comment) : new Uint8Array(0);
-    const count = BigInt(this.#entries.length);
-    const needsZip64 =
-      count >= NEEDS_ZIP64_16 || centralOffset >= NEEDS_ZIP64_32 || centralSize >= NEEDS_ZIP64_32;
+      const count = BigInt(this.#entries.length);
+      const needsZip64 =
+        count >= NEEDS_ZIP64_16 || centralOffset >= NEEDS_ZIP64_32 || centralSize >= NEEDS_ZIP64_32;
 
-    if (needsZip64) {
-      await this.#write(zip64End(count, centralSize, centralOffset, this.#offset));
+      if (needsZip64) {
+        await this.#write(zip64End(count, centralSize, centralOffset, this.#offset));
+      }
+      await this.#write(
+        endOfCentralDirectory(count, centralSize, centralOffset, comment, needsZip64),
+      );
+      this.#released = true;
+      await this.#sink.end();
+    } catch (error) {
+      // Without this a second close() would take the `#closed` early return and
+      // report success for an archive that has no end record.
+      this.#failure = { cause: error };
+      await this.#release();
+      throw error;
     }
-    await this.#write(
-      endOfCentralDirectory(count, centralSize, centralOffset, comment, needsZip64),
-    );
-    await this.#sink.end();
   }
+}
+
+/**
+ * Name and comment lengths go in 16-bit fields, and it is the *encoded* byte
+ * count that has to fit — 30,000 Korean characters are 90,000 bytes. Left to
+ * `setUint16` the length wraps and the archive is silently unreadable.
+ */
+function fieldBytes(bytes: Uint8Array, what: string, entry?: string): Uint8Array {
+  if (bytes.length > 0xffff) {
+    throw new ZipError(`${what} is ${bytes.length} bytes, over the ZIP limit of 65535`, { entry });
+  }
+  return bytes;
 }
 
 /**

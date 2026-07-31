@@ -4,8 +4,9 @@ export class ZipError extends Error {
   /** Entry name the problem belongs to, when known. */
   readonly entry?: string;
 
-  constructor(message: string, opts?: { offset?: number; entry?: string }) {
-    super(message);
+  constructor(message: string, opts?: { offset?: number; entry?: string; cause?: unknown }) {
+    // Error reads `cause` off the options bag and ignores the rest.
+    super(message, opts);
     this.name = new.target.name;
     if (opts?.offset !== undefined) this.offset = opts.offset;
     if (opts?.entry !== undefined) this.entry = opts.entry;

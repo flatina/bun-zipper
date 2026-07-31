@@ -8,6 +8,7 @@ import {
   MemorySink,
   sanitizeEntryPath,
   ZipCrcError,
+  ZipError,
   ZipFormatError,
   ZipReader,
   ZipSecurityError,
@@ -363,6 +364,126 @@ describe("path rules that only bite on Windows", () => {
 
   test("UNC is reported as UNC, not as an absolute path", () => {
     expect(() => sanitizeEntryPath("//server/share/f.txt")).toThrow(/UNC/);
+  });
+});
+
+describe("16-bit field limits", () => {
+  test("a name at the limit round-trips; one byte over is refused", async () => {
+    const atLimit = "x".repeat(0xffff);
+    const reader = await ZipReader.open(await zip({ [atLimit]: "ok" }));
+    expect(reader.entries[0]!.name).toHaveLength(0xffff);
+
+    await expect(zip({ [`${atLimit}x`]: "ok" })).rejects.toThrow(ZipError);
+  });
+
+  test("the limit is on encoded bytes, not characters", async () => {
+    // 22,000 hangul characters are 66,000 bytes; a length check on the string
+    // would wave this through and the field would wrap.
+    await expect(zip({ ["한".repeat(22_000)]: "ok" })).rejects.toThrow(/65535/);
+  });
+
+  test("comments are checked too", async () => {
+    const sink = new MemorySink();
+    const writer = new ZipWriter(sink, { comment: "c".repeat(0x10000) });
+    await expect(writer.add("a.txt", "x", { comment: "e".repeat(0x10000) })).rejects.toThrow(
+      /entry comment/,
+    );
+
+    const clean = new ZipWriter(new MemorySink(), { comment: "c".repeat(0x10000) });
+    await clean.add("a.txt", "x");
+    await expect(clean.close()).rejects.toThrow(/archive comment/);
+  });
+});
+
+describe("writer state after a failure", () => {
+  /** Records whether the sink was released, which is what unlocks the file on Windows. */
+  function trackingSink(failOnWrite = -1) {
+    const state = { ended: false, writes: 0 };
+    const sink = {
+      write(chunk: Uint8Array): number {
+        if (state.writes++ === failOnWrite) throw new Error("sink is gone");
+        return chunk.length;
+      },
+      end(): void {
+        state.ended = true;
+      },
+    };
+    return { sink, state };
+  }
+
+  test("a failed streaming add poisons the writer instead of vanishing", async () => {
+    const { sink, state } = trackingSink();
+    const writer = new ZipWriter(sink);
+    await writer.add("before.txt", "first");
+
+    const source = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.error(new Error("source died mid-stream"));
+      },
+    });
+    await expect(writer.add("broken.bin", source)).rejects.toThrow("source died mid-stream");
+
+    // Without this the entry's local header stays on the wire while the central
+    // directory omits it, and every tool calls the result a clean archive.
+    await expect(writer.add("after.txt", "second")).rejects.toThrow(ZipError);
+    await expect(writer.close()).rejects.toThrow(ZipError);
+    expect(state.ended).toBe(true);
+  });
+
+  test("a sink that fails mid-write poisons it the same way", async () => {
+    const { sink, state } = trackingSink(1);
+    const writer = new ZipWriter(sink);
+    await expect(writer.add("a.txt", "payload")).rejects.toThrow("sink is gone");
+    await expect(writer.close()).rejects.toThrow(ZipError);
+    expect(state.ended).toBe(true);
+  });
+
+  test("a sink that fails during close() cannot report success on retry", async () => {
+    const { sink, state } = trackingSink(2);
+    const writer = new ZipWriter(sink);
+    await writer.add("a.txt", "x");
+    await expect(writer.close()).rejects.toThrow("sink is gone");
+    // The early return for an already-closed writer used to swallow this and
+    // resolve, handing back an archive with no end record.
+    await expect(writer.close()).rejects.toThrow(ZipError);
+    expect(state.ended).toBe(true);
+  });
+
+  test("a sink failure on a streamed entry does not deadlock", async () => {
+    // Nothing drains the compressor once the sink throws, so the feed loop
+    // would wait on backpressure that never lifts. Needs enough data to fill
+    // the internal queue; a small payload never reaches the stall.
+    const { sink } = trackingSink(3);
+    const writer = new ZipWriter(sink);
+    let pulled = 0;
+    const source = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (pulled++ >= 2000) return c.close();
+        c.enqueue(new Uint8Array(64 * 1024).fill(pulled & 0xff));
+      },
+    });
+    await expect(writer.add("big.bin", source)).rejects.toThrow("sink is gone");
+  }, 15_000);
+
+  test("a date outside the DOS range clamps rather than poisoning the writer", async () => {
+    const sink = new MemorySink();
+    const writer = new ZipWriter(sink);
+    // DOS packs the year into 7 bits; 2200 does not fit, and the 16-bit guard
+    // turned that into a failed add that took the whole archive with it.
+    await writer.add("future.txt", "x", { modifiedAt: new Date(2200, 0, 1) });
+    await writer.add("past.txt", "y", { modifiedAt: new Date(1970, 0, 1) });
+    await writer.close();
+
+    const reader = await ZipReader.open(sink.toBytes());
+    expect(reader.entries.map((e) => e.modifiedAt?.getFullYear())).toEqual([2107, 1980]);
+  });
+
+  test("a rejected name leaves the writer usable", async () => {
+    const { sink } = trackingSink();
+    const writer = new ZipWriter(sink);
+    await expect(writer.add("x".repeat(0x10000), "x")).rejects.toThrow(ZipError);
+    await writer.add("a.txt", "fine");
+    await writer.close();
   });
 });
 

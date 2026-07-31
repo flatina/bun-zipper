@@ -1,4 +1,4 @@
-import { ZipFormatError } from "./errors.ts";
+import { ZipError, ZipFormatError } from "./errors.ts";
 
 /** Growable little-endian byte writer. */
 export class ByteWriter {
@@ -34,7 +34,15 @@ export class ByteWriter {
   // lookup before the argument, so an inlined call would write to the discarded
   // buffer. It only surfaces once a write crosses the current capacity.
 
+  /**
+   * `setUint16` masks instead of failing, so an oversized length would be
+   * written truncated and the archive would be silently wrong. Callers that can
+   * exceed it check first and say which field; this is the net under them.
+   */
   u16(value: number): this {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffff) {
+      throw new ZipError(`${value} does not fit a 16-bit field`, { offset: this.#len });
+    }
     const at = this.#reserve(2);
     this.#view.setUint16(at, value, true);
     return this;

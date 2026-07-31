@@ -32,10 +32,15 @@ export const EXTRA_UNICODE_PATH = 0x7075;
 export const MAX_COMMENT_SIZE = 0xffff;
 
 const DOS_EPOCH_YEAR = 1980;
+/** The year gets 7 bits, so anything outside 1980–2107 has to be clamped to fit. */
+const DOS_MAX_YEAR = DOS_EPOCH_YEAR + 0x7f;
 
 export function toDosTime(date: Date): { time: number; date: number } {
   const year = date.getFullYear();
   if (year < DOS_EPOCH_YEAR) return { time: 0, date: (1 << 5) | 1 };
+  if (year > DOS_MAX_YEAR) {
+    return { time: (23 << 11) | (59 << 5) | 29, date: (0x7f << 9) | (12 << 5) | 31 };
+  }
   return {
     time: (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1),
     date: ((year - DOS_EPOCH_YEAR) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
