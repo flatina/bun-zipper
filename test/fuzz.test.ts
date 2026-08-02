@@ -10,13 +10,24 @@ import { sanitizeEntryPath, unzip, ZipError, ZipSecurityError, zip } from "../sr
  * as a fixed case rather than leaving the seed to carry it.
  */
 
-/** Deterministic pseudo-random, so a failing case is nameable. */
+/**
+ * Deterministic pseudo-random, so a failing case is nameable.
+ *
+ * The seed is scrambled and the generator warmed before use. Feeding this LCG
+ * 1, 2, 3… puts the first output of every seed within a hair of the last: seeds
+ * 1 to 300 spanned 0.236 to 0.352, so a "random offset" derived from it covered
+ * an eighth of the archive and the same eighth every time.
+ */
 function random(seed: number): () => number {
-  let s = seed >>> 0;
-  return () => {
+  let s = ((seed >>> 0) * 2654435761) >>> 0;
+  const next = (): number => {
     s = (s * 1664525 + 1013904223) >>> 0;
     return s / 0x100000000;
   };
+  next();
+  next();
+  next();
+  return next;
 }
 
 /** Deflated and stored entries, a directory, a comment, non-ASCII — several shapes to hit. */
