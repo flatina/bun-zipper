@@ -43,19 +43,25 @@ export async function extractZip(
   const planned = plan(selected, reader.limits);
   await inspectDestination(root, planned, options.overwrite === true);
 
-  // Created only once everything above has passed, so a refusal leaves the
-  // filesystem as it was — including the destination itself.
-  await mkdirInside(anchor, tail, destination);
-
   const written: string[] = [];
+  // Everything this call brought into being, directories included, in the order
+  // it happened. Undoing a half-done extraction means walking it backwards.
+  const created: string[] = [];
   const budget = new TotalSizeBudget(reader.limits.maxTotalUncompressedSize);
 
   try {
-    await write(planned, root, written, budget, options.overwrite === true);
+    // Created only once every check above has passed, so a refusal leaves the
+    // filesystem as it was — including the destination itself.
+    await mkdirInside(anchor, tail, destination, created);
+    await write(planned, root, written, created, budget, options.overwrite === true);
   } catch (error) {
     // Without atomic staging a failure partway leaves earlier entries in place,
-    // and the caller cannot clean up what it was never told about.
-    if (error instanceof ZipError) error.installed = written;
+    // and the caller cannot clean up what it was never told about. Filesystem
+    // errors arrive as themselves, not as ZipError, and they are the ones most
+    // likely to strike halfway.
+    if (typeof error === "object" && error !== null) {
+      (error as { installed?: readonly string[] }).installed = created;
+    }
     throw error;
   }
   return written;
@@ -65,6 +71,7 @@ async function write(
   planned: readonly Planned[],
   root: string,
   written: string[],
+  created: string[],
   budget: TotalSizeBudget,
   overwrite: boolean,
 ): Promise<void> {
@@ -79,10 +86,10 @@ async function write(
     }
 
     if (entry.isDirectory) {
-      await mkdirInside(root, parts, entry.name);
+      await mkdirInside(root, parts, entry.name, created);
       continue;
     }
-    await mkdirInside(root, parts.slice(0, -1), entry.name);
+    await mkdirInside(root, parts.slice(0, -1), entry.name, created);
 
     // A symlink here would be followed by the write, landing the bytes wherever
     // it points. `exists()` cannot see a dangling one, so lstat is what decides.
@@ -113,8 +120,10 @@ async function write(
       });
     }
 
-    await install(entry, realParent, basename(target), budget, overwrite);
-    written.push(target);
+    await install(entry, realParent, basename(target), budget, overwrite, () => {
+      written.push(target);
+      created.push(target);
+    });
   }
 }
 
@@ -309,6 +318,7 @@ async function install(
   name: string,
   budget: TotalSizeBudget,
   overwrite: boolean,
+  commit: () => void,
 ): Promise<void> {
   let temp = "";
   let handle: FileHandle | undefined;
@@ -367,6 +377,7 @@ async function install(
     if (overwrite) {
       await rename(temp, target);
       temp = "";
+      commit();
     } else {
       // `link` refuses with EEXIST rather than replacing, which is the only way
       // this option is a guarantee instead of a check someone can race. The
@@ -377,6 +388,14 @@ async function install(
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         throw new ZipSecurityError(`refusing to overwrite ${name}`, { entry: entry.name });
       }
+      // The entry exists under its real name from here, so it is reported before
+      // the second name goes: a failure removing that one must not make a file
+      // that is on disk look like one that never arrived. It is also not
+      // suppressed — a leftover temp the caller never hears about is worse.
+      commit();
+      const stray = temp;
+      temp = "";
+      await unlink(stray);
     }
   } finally {
     // Closing may throw; the temp still has to go, and neither failure may
@@ -392,13 +411,19 @@ async function install(
  * too late — they exist by then. The root itself is exempt: it was resolved once
  * by the caller, so reaching it through a symlink (macOS `/tmp`) stays legal.
  */
-async function mkdirInside(root: string, parts: string[], entry: string): Promise<void> {
+async function mkdirInside(
+  root: string,
+  parts: string[],
+  entry: string,
+  created?: string[],
+): Promise<void> {
   let at = root;
   for (const part of parts) {
     at = join(at, part);
     const info = await lstat(at).catch(() => undefined);
     if (info === undefined) {
       await mkdir(at);
+      created?.push(at);
       continue;
     }
     if (info.isSymbolicLink()) {

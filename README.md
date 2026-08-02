@@ -135,8 +135,9 @@ mismatch throws unless `onCrcMismatch` says otherwise.
 What preflight cannot know is what only reading reveals: a CRC or size mismatch,
 a corrupt deflate stream, a local header disagreeing with the central one, or an
 IO error. `extractZip` is not atomic, so those leave the entries already written
-in place — the error carries them as `installed` so you can undo them. Extract to
-a scratch directory if you need all-or-nothing.
+in place. The error carries an `installed` array — every path the call created,
+directories included, in the order it created them, so undoing it means walking
+that backwards. Extract to a scratch directory if you need all-or-nothing.
 
 Putting an entry in place replaces the inode rather than truncating a file, so
 mode, ownership and ACLs come from the new file, readers holding the old one keep

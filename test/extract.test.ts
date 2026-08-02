@@ -166,6 +166,34 @@ describe("extractZip", () => {
     expect(await readdir(dir)).toEqual([]);
   });
 
+  test("a mid-extraction failure reports the directories it made, not only files", async () => {
+    // Corrupt the payload of the entry that sorts last, so the first one and the
+    // directories are already on disk when it fails.
+    const archive = (
+      await zip({
+        "d/first.txt": { data: "kept", compression: "store" },
+        "d/second.bin": { data: "y".repeat(2048), compression: "store" },
+      })
+    ).slice();
+    const nameAt = indexOfBytes(archive, new TextEncoder().encode("d/second.bin"));
+    const view = new DataView(archive.buffer);
+    const header = nameAt - 30;
+    const payload = nameAt + view.getUint16(header + 26, true) + view.getUint16(header + 28, true);
+    archive[payload] = archive[payload]! ^ 0xff;
+
+    let error: ZipCrcError | undefined;
+    await extractZip(archive, join(dir, "into")).catch((e) => {
+      error = e as ZipCrcError;
+    });
+
+    // Cleaning up only the files would leave "into" and "into/d" behind.
+    expect(error?.installed).toEqual([
+      join(dir, "into"),
+      join(dir, "into", "d"),
+      join(dir, "into", "d", "first.txt"),
+    ]);
+  });
+
   test("a failure reports what it already wrote", async () => {
     await Bun.write(join(dir, "second.txt"), "existing");
     let error: ZipSecurityError | undefined;
