@@ -1,7 +1,9 @@
 import type { FileHandle } from "node:fs/promises";
 import { link, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import { worstCaseInflatedSize } from "./compress.ts";
 import { ZipError, ZipSecurityError, ZipUnsupportedError } from "./errors.ts";
+import { METHOD_STORE } from "./format.ts";
 import { sanitizeEntryPath } from "./path.ts";
 import {
   TotalSizeBudget,
@@ -16,6 +18,9 @@ const S_IFLNK = 0o120000;
 
 /** Write granularity, matching the reader's own slice size. */
 const WRITE_BLOCK = 1024 * 1024;
+
+/** What a filesystem without hard links answers `link` with. */
+const NO_HARD_LINKS = new Set(["EPERM", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EMLINK", "EXDEV"]);
 
 export interface ExtractOptions extends ZipReaderOptions {
   /** Off by default, so extraction cannot clobber. */
@@ -39,10 +44,6 @@ export async function extractZip(
   // twice for one entry is something they can see.
   const selected = options.filter ? reader.entries.filter(options.filter) : [...reader.entries];
 
-  const { anchor, tail, root } = await resolveRoot(destination);
-  const planned = plan(selected, reader.limits);
-  await inspectDestination(root, planned, options.overwrite === true);
-
   const written: string[] = [];
   // Everything this call brought into being, directories included, in the order
   // it happened. Undoing a half-done extraction means walking it backwards.
@@ -50,6 +51,10 @@ export async function extractZip(
   const budget = new TotalSizeBudget(reader.limits.maxTotalUncompressedSize);
 
   try {
+    const { anchor, tail, root } = await resolveRoot(destination);
+    const planned = plan(selected, reader.limits);
+    await inspectDestination(root, planned, options.overwrite === true);
+
     // Created only once every check above has passed, so a refusal leaves the
     // filesystem as it was — including the destination itself.
     await mkdirInside(anchor, tail, destination, created);
@@ -145,13 +150,23 @@ async function resolveRoot(
   const wanted = resolve(destination);
   const tail: string[] = [];
   let at = wanted;
-  while ((await lstat(at).catch(() => undefined)) === undefined) {
+  let info = await lstat(at).catch(() => undefined);
+  while (info === undefined) {
     const parent = dirname(at);
     if (parent === at) throw new ZipError(`no existing ancestor of ${destination}`);
     tail.unshift(basename(at));
     at = parent;
+    info = await lstat(at).catch(() => undefined);
   }
-  const anchor = await realpath(at);
+  // Both of these otherwise surface far later and unrecognisably: a dangling
+  // symlink as a raw ENOENT from realpath, a plain file as an ENOENT naming a
+  // path underneath it once the first entry tries to open its temp.
+  const anchor = await realpath(at).catch(() => {
+    throw new ZipError(`${at} does not resolve to a real path`);
+  });
+  if (!(await lstat(anchor).catch(() => undefined))?.isDirectory()) {
+    throw new ZipError(`${anchor} exists and is not a directory`);
+  }
   return { anchor, tail, root: join(anchor, ...tail) };
 }
 
@@ -178,31 +193,36 @@ function plan(entries: readonly ZipEntry[], limits: ZipReader["limits"]): Planne
     if (entry.unixMode !== undefined && (entry.unixMode & S_IFMT) === S_IFLNK) {
       throw new ZipSecurityError("archive contains a symbolic link", { entry: entry.name });
     }
-    if (entry.isEncrypted) {
-      throw new ZipUnsupportedError("entry is encrypted; encryption is not supported", {
-        entry: entry.name,
-      });
-    }
-    if (!entry.isDirectory && entry.compressionMethod !== 0 && entry.compressionMethod !== 8) {
-      throw new ZipUnsupportedError(
-        `compression method ${entry.compressionMethod} is not supported (only store and deflate)`,
-        { entry: entry.name },
-      );
-    }
-    if (entry.uncompressedSize > limits.maxEntryUncompressedSize) {
-      throw new ZipSecurityError(
-        `entry is ${entry.uncompressedSize} bytes, over the ${limits.maxEntryUncompressedSize} limit`,
-        { entry: entry.name },
-      );
-    }
-    if (
-      entry.compressedSize > 0n &&
-      Number(entry.uncompressedSize) / Number(entry.compressedSize) > limits.maxCompressionRatio
-    ) {
-      throw new ZipSecurityError(
-        `compression ratio exceeds the ${limits.maxCompressionRatio}:1 limit`,
-        { entry: entry.name },
-      );
+    // Directory records are never read, so their declarations are not checked
+    // either — several writers leave junk in them, and refusing here would turn
+    // archives that extract today into failures.
+    if (!entry.isDirectory) {
+      if (entry.isEncrypted) {
+        throw new ZipUnsupportedError("entry is encrypted; encryption is not supported", {
+          entry: entry.name,
+        });
+      }
+      if (entry.compressionMethod !== 0 && entry.compressionMethod !== 8) {
+        throw new ZipUnsupportedError(
+          `compression method ${entry.compressionMethod} is not supported (only store and deflate)`,
+          { entry: entry.name },
+        );
+      }
+      if (entry.uncompressedSize > limits.maxEntryUncompressedSize) {
+        throw new ZipSecurityError(
+          `entry is ${entry.uncompressedSize} bytes, over the ${limits.maxEntryUncompressedSize} limit`,
+          { entry: entry.name },
+        );
+      }
+      if (
+        entry.compressedSize > 0n &&
+        Number(entry.uncompressedSize) / Number(entry.compressedSize) > limits.maxCompressionRatio
+      ) {
+        throw new ZipSecurityError(
+          `compression ratio exceeds the ${limits.maxCompressionRatio}:1 limit`,
+          { entry: entry.name },
+        );
+      }
     }
 
     const relative = sanitizeEntryPath(entry.name);
@@ -213,10 +233,18 @@ function plan(entries: readonly ZipEntry[], limits: ZipReader["limits"]): Planne
     // after the file landed is the failure this exists to prevent.
     const leaf = entry.isDirectory ? parts.length : parts.length - 1;
     for (let i = 0; i < leaf; i++) {
-      directories.set(
-        collationKey(parts.slice(0, i + 1).join("/")),
-        parts.slice(0, i + 1).join("/"),
-      );
+      const path = parts.slice(0, i + 1).join("/");
+      const key = collationKey(path);
+      const clash = directories.get(key);
+      // Two components that fold together are one directory on NTFS and APFS
+      // and two on ext4 — the archive unpacking differently depending on where
+      // is the thing this exists to stop.
+      if (clash !== undefined && clash !== path) {
+        throw new ZipError(`${path} and ${clash} extract to the same directory`, {
+          entry: entry.name,
+        });
+      }
+      directories.set(key, path);
     }
     if (!entry.isDirectory) {
       const key = collationKey(relative);
@@ -322,13 +350,15 @@ async function install(
 ): Promise<void> {
   let temp = "";
   let handle: FileHandle | undefined;
-  for (;;) {
+  // 48 bits of name makes a real collision irrelevant; the cap is there so that
+  // anything else answering EEXIST fails instead of spinning.
+  for (let attempt = 0; ; attempt++) {
     temp = join(parent, tempName());
     try {
       handle = await open(temp, "wx");
       break;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt >= 8) throw error;
     }
   }
 
@@ -340,20 +370,30 @@ async function install(
     let filled = 0;
     const flush = async (): Promise<void> => {
       // A short write is permitted by the API even when it never happens in
-      // practice, so the remainder is written rather than assumed.
+      // practice, so the remainder is written rather than assumed. Zero is a
+      // permitted short write too, and looping on it would never end.
       for (let at = 0; at < filled; ) {
-        at += (await handle!.write(block, at, filled - at)).bytesWritten;
+        const { bytesWritten } = await handle!.write(block, at, filled - at);
+        if (bytesWritten <= 0) throw new ZipError(`write to ${entry.name} made no progress`);
+        at += bytesWritten;
       }
       filled = 0;
     };
 
-    // Entries that fit one block are read in a single inflate call, which is
-    // several times faster than driving a decompression stream for them. The
-    // peak is the same either way, so only the speed differs. The declared size
-    // is untrusted, but it decides nothing here except which path runs — both
-    // verify, and both are capped.
+    // Small entries are read in a single inflate call, which is several times
+    // faster than driving a decompression stream for them.
+    //
+    // The test is what the *payload* can produce, never what the header claims.
+    // `bytes()` bounds itself by `maxInflateBuffer` — 8 GiB by default — so
+    // choosing it on a declared size hands the peak to whoever wrote the
+    // archive: 255 KB declaring 100 bytes drove 342 MB through here. A stored
+    // entry yields its compressed length exactly; deflate cannot beat 1032:1.
+    const ceiling =
+      entry.compressionMethod === METHOD_STORE
+        ? entry.compressedSize
+        : worstCaseInflatedSize(entry.compressedSize);
     const source =
-      entry.uncompressedSize <= BigInt(WRITE_BLOCK)
+      ceiling <= BigInt(WRITE_BLOCK)
         ? [await entry.bytes()]
         : ((await entry.stream()) as unknown as AsyncIterable<Uint8Array>);
 
@@ -385,8 +425,18 @@ async function install(
       try {
         await link(temp, target);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        throw new ZipSecurityError(`refusing to overwrite ${name}`, { entry: entry.name });
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "EEXIST") {
+          throw new ZipSecurityError(`refusing to overwrite ${name}`, { entry: entry.name });
+        }
+        // FAT, exFAT and many network filesystems have no hard links at all.
+        // Falling back keeps them working; the option degrades there from a
+        // guarantee to the check already made above, which is documented.
+        if (!NO_HARD_LINKS.has(code ?? "")) throw error;
+        await rename(temp, target);
+        temp = "";
+        commit();
+        return;
       }
       // The entry exists under its real name from here, so it is reported before
       // the second name goes: a failure removing that one must not make a file

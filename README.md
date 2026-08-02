@@ -122,9 +122,14 @@ much as the destination directory, and refuses:
 Each entry is written to a temporary file beside its target and put in place only
 after its CRC and size verify. With `overwrite: false` the install is `link`,
 which refuses rather than replacing, so the option holds even against something
-racing it; with `overwrite: true` it is `rename`. Either way nothing is written
-through a symlink sitting at the target, and peak memory is a block rather than
-the entry.
+racing it; with `overwrite: true` it is `rename`. On filesystems without hard
+links — FAT, exFAT, many network mounts — the first falls back to `rename`, and
+there the option is only as good as the check that precedes it. Either way
+nothing is written through a symlink sitting at the target.
+
+Peak memory per entry is a block, except where the payload itself cannot exceed
+one: those are inflated in a single call, which is faster. The test is what the
+compressed bytes could produce, never what the header declares.
 
 `limits` has safe defaults: `maxEntries`, `maxEntryUncompressedSize`,
 `maxTotalUncompressedSize`, `maxCompressionRatio`. `unzip` and `extractZip`

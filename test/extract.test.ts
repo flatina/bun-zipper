@@ -11,6 +11,15 @@ import {
   zip,
 } from "../src/index.ts";
 
+/** Offset of the first central directory header. */
+function findCentralOffset(archive: Uint8Array): number {
+  const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+  for (let i = 0; i + 4 <= archive.length; i++) {
+    if (view.getUint32(i, true) === 0x02014b50) return i;
+  }
+  throw new Error("central header not found");
+}
+
 /** First offset where `needle` occurs, for reaching into a built archive. */
 function indexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
   outer: for (let i = 0; i + needle.length <= haystack.length; i++) {
@@ -192,6 +201,42 @@ describe("extractZip", () => {
       join(dir, "into", "d"),
       join(dir, "into", "d", "first.txt"),
     ]);
+  });
+
+  test("a streamed entry that fails leaves nothing, not even the temp", async () => {
+    // Over the block size, so this is the streaming arm — the other CRC tests
+    // are all small enough to take the single-inflate one.
+    const big = new Uint8Array(3 * 1024 * 1024);
+    let s = 7;
+    for (let i = 0; i < big.length; i++) {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      big[i] = (s >>> 24) & 0xff;
+    }
+    const archive = (await zip({ "big.bin": { data: big, compression: "store" } })).slice();
+    const nameAt = indexOfBytes(archive, new TextEncoder().encode("big.bin"));
+    const view = new DataView(archive.buffer);
+    const payload =
+      nameAt + view.getUint16(nameAt - 30 + 26, true) + view.getUint16(nameAt - 30 + 28, true);
+    archive[payload + 1024] = archive[payload + 1024]! ^ 0xff;
+
+    await expect(extractZip(archive, dir)).rejects.toThrow(ZipCrcError);
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  test("the declared size does not decide how much memory an entry may take", async () => {
+    // A tiny archive claiming a tiny entry, whose payload inflates to far more.
+    // Choosing the buffered read on that claim hands the peak to the archive.
+    const archive = (await zip({ "bomb.bin": new Uint8Array(32 * 1024 * 1024) })).slice();
+    const view = new DataView(archive.buffer);
+    view.setUint32(
+      indexOfBytes(archive, new TextEncoder().encode("bomb.bin")) - 30 + 22,
+      100,
+      true,
+    );
+    view.setUint32(findCentralOffset(archive) + 24, 100, true);
+
+    await expect(extractZip(archive, dir)).rejects.toThrow(ZipSecurityError);
+    expect(await readdir(dir)).toEqual([]);
   });
 
   test("a failure reports what it already wrote", async () => {
