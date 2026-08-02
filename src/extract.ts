@@ -1,4 +1,5 @@
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
+import { link, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { ZipError, ZipSecurityError } from "./errors.ts";
 import { sanitizeEntryPath } from "./path.ts";
@@ -12,6 +13,9 @@ import {
 
 const S_IFMT = 0o170000;
 const S_IFLNK = 0o120000;
+
+/** Write granularity, matching the reader's own slice size. */
+const WRITE_BLOCK = 1024 * 1024;
 
 export interface ExtractOptions extends ZipReaderOptions {
   /** Off by default, so extraction cannot clobber. */
@@ -90,12 +94,108 @@ export async function extractZip(
       });
     }
 
-    const bytes = await entry.bytes();
-    budget.spend(bytes.length, entry.name);
-    await Bun.write(join(realParent, basename(target)), bytes);
+    await install(entry, realParent, basename(target), budget, options.overwrite === true);
     written.push(target);
   }
   return written;
+}
+
+/** Enough to make a guess useless; the name never derives from the entry. */
+function tempName(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return `.bz-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}.tmp`;
+}
+
+/**
+ * Streams the entry into a temp file beside its target, then puts it in place.
+ *
+ * Writing the target directly would follow a symlink sitting there; neither
+ * `link` nor `rename` follows one at the final component, so the install itself
+ * is what keeps the bytes inside the destination. The temp is created `wx` so it
+ * cannot be an attacker's file either, and the entry is verified — CRC and size —
+ * before any of this is visible under its real name.
+ */
+async function install(
+  entry: ZipEntry,
+  parent: string,
+  name: string,
+  budget: TotalSizeBudget,
+  overwrite: boolean,
+): Promise<void> {
+  let temp = "";
+  let handle: FileHandle | undefined;
+  for (;;) {
+    temp = join(parent, tempName());
+    try {
+      handle = await open(temp, "wx");
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+
+  try {
+    // Inflated data arrives in 16 KiB chunks, so writing each one would cost a
+    // syscall per 16 KiB. Gathering them first trades a copy for 64x fewer
+    // writes and holds the same peak the stored path already does.
+    const block = new Uint8Array(WRITE_BLOCK);
+    let filled = 0;
+    const flush = async (): Promise<void> => {
+      // A short write is permitted by the API even when it never happens in
+      // practice, so the remainder is written rather than assumed.
+      for (let at = 0; at < filled; ) {
+        at += (await handle!.write(block, at, filled - at)).bytesWritten;
+      }
+      filled = 0;
+    };
+
+    // Entries that fit one block are read in a single inflate call, which is
+    // several times faster than driving a decompression stream for them. The
+    // peak is the same either way, so only the speed differs. The declared size
+    // is untrusted, but it decides nothing here except which path runs — both
+    // verify, and both are capped.
+    const source =
+      entry.uncompressedSize <= BigInt(WRITE_BLOCK)
+        ? [await entry.bytes()]
+        : ((await entry.stream()) as unknown as AsyncIterable<Uint8Array>);
+
+    for await (const chunk of source) {
+      // Spent per chunk: an entry whose real size outruns what it declared has
+      // to stop here, not once the whole thing is on disk.
+      budget.spend(chunk.length, entry.name);
+      for (let at = 0; at < chunk.length; ) {
+        if (filled === block.length) await flush();
+        const take = Math.min(block.length - filled, chunk.length - at);
+        block.set(chunk.subarray(at, at + take), filled);
+        filled += take;
+        at += take;
+      }
+    }
+    await flush();
+    await handle.close();
+    handle = undefined;
+
+    const target = join(parent, name);
+    if (overwrite) {
+      await rename(temp, target);
+      temp = "";
+    } else {
+      // `link` refuses with EEXIST rather than replacing, which is the only way
+      // this option is a guarantee instead of a check someone can race. The
+      // earlier check reports the ordinary case; this catches the race.
+      try {
+        await link(temp, target);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        throw new ZipSecurityError(`refusing to overwrite ${name}`, { entry: entry.name });
+      }
+    }
+  } finally {
+    // Closing may throw; the temp still has to go, and neither failure may
+    // replace the error that brought us here.
+    await handle?.close().catch(() => {});
+    if (temp !== "") await unlink(temp).catch(() => {});
+  }
 }
 
 /**

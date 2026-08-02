@@ -2,7 +2,23 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { link, mkdtemp, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractZip, MemorySink, ZipSecurityError, ZipWriter, zip } from "../src/index.ts";
+import {
+  extractZip,
+  MemorySink,
+  ZipCrcError,
+  ZipSecurityError,
+  ZipWriter,
+  zip,
+} from "../src/index.ts";
+
+/** First offset where `needle` occurs, for reaching into a built archive. */
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
+  outer: for (let i = 0; i + needle.length <= haystack.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (haystack[i + j] !== needle[j]) continue outer;
+    return i;
+  }
+  throw new Error("not found");
+}
 
 let dir = "";
 
@@ -68,6 +84,46 @@ describe("extractZip", () => {
     await expect(extractZip(await zip({ a: "clobber" }), dir, { overwrite: true })).rejects.toThrow(
       /exists as a directory/,
     );
+  });
+
+  test("a failed entry leaves neither a partial file nor a temp behind", async () => {
+    // CRC is verified before anything is installed under its real name, and the
+    // temp the bytes passed through has to go with the failure.
+    const archive = (
+      await zip({
+        "ok.txt": { data: "first", compression: "store" },
+        "bad.bin": { data: "x".repeat(4096), compression: "store" },
+      })
+    ).slice();
+
+    // Local header: 30 fixed bytes, then the name. Find the name to reach the payload.
+    const nameAt = indexOfBytes(archive, new TextEncoder().encode("bad.bin"));
+    const view = new DataView(archive.buffer);
+    const header = nameAt - 30;
+    const payload = nameAt + view.getUint16(header + 26, true) + view.getUint16(header + 28, true);
+    archive[payload] = archive[payload]! ^ 0xff;
+
+    await expect(extractZip(archive, dir)).rejects.toThrow(ZipCrcError);
+    expect(await readdir(dir)).toEqual(["ok.txt"]);
+  });
+
+  test("nothing is left over when extraction succeeds", async () => {
+    await extractZip(await zip({ "a.txt": "x", "d/b.txt": "y" }), dir);
+    expect((await readdir(dir)).sort()).toEqual(["a.txt", "d"]);
+    expect(await readdir(join(dir, "d"))).toEqual(["b.txt"]);
+  });
+
+  test("an entry past the block size round-trips through the streamed path", async () => {
+    // Incompressible, so it stays over the block size on disk as well as in
+    // memory and does not trip the ratio limit.
+    const big = new Uint8Array(3 * 1024 * 1024);
+    let s = 7;
+    for (let i = 0; i < big.length; i++) {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      big[i] = (s >>> 24) & 0xff;
+    }
+    await extractZip(await zip({ "big.bin": big }), dir);
+    expect(await Bun.file(join(dir, "big.bin")).bytes()).toEqual(big);
   });
 
   test("filter skips entries", async () => {
