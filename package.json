@@ -1,6 +1,6 @@
 {
   "name": "@flatina/bun-zipper",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "ZIP container reader/writer for Bun. No bundled compression algorithm — deflate is the runtime's.",
   "type": "module",
   "license": "MIT",
