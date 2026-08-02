@@ -176,6 +176,34 @@ describe("corrupt archives", () => {
   });
 });
 
+describe("streamed reads are capped too", () => {
+  /** Declares 100 uncompressed bytes over a payload that inflates to 64 MB. */
+  async function understated(): Promise<Uint8Array> {
+    const archive = (await zip({ "bomb.bin": new Uint8Array(64 * 1024 * 1024) })).slice();
+    const view = new DataView(archive.buffer);
+    // The compressed size stays honest — it is how many bytes get read off disk.
+    view.setUint32(findSignature(archive, 0x04034b50) + 22, 100, true);
+    view.setUint32(findCentral(archive) + 24, 100, true);
+    return archive;
+  }
+
+  test("the cap applies per chunk, not at the end", async () => {
+    const reader = await ZipReader.open(await understated());
+    const stream = (await reader.entries[0]!.stream()) as unknown as AsyncIterable<Uint8Array>;
+
+    let delivered = 0;
+    // The ratio guard compares declared sizes, so this archive walks past it.
+    // Without a running cap the whole 64 MB reaches the consumer — spent disk or
+    // memory — and only the flush-time size check objects.
+    await expect(
+      (async () => {
+        for await (const chunk of stream) delivered += chunk.length;
+      })(),
+    ).rejects.toThrow(ZipSecurityError);
+    expect(delivered).toBeLessThan(1024 * 1024);
+  });
+});
+
 describe("unsupported features", () => {
   test("encrypted entries are refused with a clear error", async () => {
     const archive = await zip({ "a.txt": "hello" });

@@ -627,6 +627,16 @@ function makeEntry(
     }
   };
 
+  /**
+   * Most output this entry may produce. The declared size is untrusted, so it
+   * bounds nothing on its own — but an entry that exceeds what it declared is
+   * lying either way, and the configured limit bounds the lie.
+   */
+  const outputCap = (): bigint =>
+    record.uncompressedSize < limits.maxEntryUncompressedSize
+      ? record.uncompressedSize
+      : limits.maxEntryUncompressedSize;
+
   const locateData = async (): Promise<{ start: number; length: number; localCrc?: number }> => {
     const { start, localCrc } = await findDataStart(source, record);
     const length = toSafeInt(record.compressedSize, "compressed size");
@@ -674,12 +684,7 @@ function makeEntry(
       if (isDirectory) return new Uint8Array(0);
       checkReadable();
       const compressed = await readCompressed();
-      // Stop at whichever ceiling comes first; a header that under-reports its
-      // size must not be able to expand past the configured limit.
-      const cap =
-        record.uncompressedSize < limits.maxEntryUncompressedSize
-          ? record.uncompressedSize
-          : limits.maxEntryUncompressedSize;
+      const cap = outputCap();
 
       // Composed with the entry limit, so tightening that for safety cannot
       // silently cost the memory bound. Only -1 opts out entirely.
@@ -747,7 +752,7 @@ function makeEntry(
       checkReadable();
       const raw = await compressedStream();
       const plain = record.method === METHOD_STORE ? raw : raw.pipeThrough(inflateTransform());
-      return plain.pipeThrough(verifyTransform(record, verifyCrc, onCrcMismatch));
+      return plain.pipeThrough(verifyTransform(record, outputCap(), verifyCrc, onCrcMismatch));
     },
   };
   return entry;
@@ -800,6 +805,7 @@ async function findDataStart(
 
 function verifyTransform(
   record: CentralRecord,
+  cap: bigint,
   verifyCrc: boolean,
   onCrcMismatch?: (info: CrcMismatch) => "throw" | "accept",
 ): TransformStream<Uint8Array, Uint8Array> {
@@ -807,6 +813,17 @@ function verifyTransform(
   let total = 0n;
   return new TransformStream({
     transform(chunk, controller) {
+      // Before the chunk goes out, not at flush: a consumer writing to disk has
+      // already spent whatever it received, so noticing at the end is too late.
+      if (total + BigInt(chunk.length) > cap) {
+        controller.error(
+          new ZipSecurityError(
+            `entry inflates past its declared size of ${record.uncompressedSize} bytes`,
+            { entry: record.name },
+          ),
+        );
+        return;
+      }
       if (verifyCrc) crc.update(chunk);
       total += BigInt(chunk.length);
       controller.enqueue(chunk);
