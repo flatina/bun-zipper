@@ -103,16 +103,28 @@ default falls short.
 
 ## Security model
 
-`extractZip` refuses, before writing anything:
+`extractZip` checks the whole archive against the destination before creating so
+much as the destination directory, and refuses:
 
 - `..` segments, absolute paths, drive letters, UNC paths, and NUL bytes
 - backslash-based variants, since Windows treats `\` as a separator
 - any entry whose resolved path would land outside the destination
-- entries whose Unix mode marks them a symlink
+- entries whose Unix mode marks them a symlink, encrypted entries, and
+  compression methods it cannot read
+- two entries that extract to the same path once case and Unicode normalization
+  are folded, and one name used as both a file and a directory
+- declared sizes over the per-entry, ratio, or archive-wide limits
 - paths that pass through a symlink or junction already in the destination —
   directories are created one component at a time so none is followed
 - targets that carry other hard links, since writing through one edits them all
 - overwriting an existing file, unless `overwrite: true`
+
+Each entry is written to a temporary file beside its target and put in place only
+after its CRC and size verify. With `overwrite: false` the install is `link`,
+which refuses rather than replacing, so the option holds even against something
+racing it; with `overwrite: true` it is `rename`. Either way nothing is written
+through a symlink sitting at the target, and peak memory is a block rather than
+the entry.
 
 `limits` has safe defaults: `maxEntries`, `maxEntryUncompressedSize`,
 `maxTotalUncompressedSize`, `maxCompressionRatio`. `unzip` and `extractZip`
@@ -120,8 +132,16 @@ additionally enforce the cumulative one — per-entry caps cannot stop an archiv
 that stays under them across many entries. A size mismatch always throws; a CRC
 mismatch throws unless `onCrcMismatch` says otherwise.
 
-`extractZip` is not atomic: when it rejects partway through, files written before
-that point stay on disk. Extract to a scratch directory if you need all-or-nothing.
+What preflight cannot know is what only reading reveals: a CRC or size mismatch,
+a corrupt deflate stream, a local header disagreeing with the central one, or an
+IO error. `extractZip` is not atomic, so those leave the entries already written
+in place — the error carries them as `installed` so you can undo them. Extract to
+a scratch directory if you need all-or-nothing.
+
+Putting an entry in place replaces the inode rather than truncating a file, so
+mode, ownership and ACLs come from the new file, readers holding the old one keep
+seeing it, and on Windows a target another process holds open will fail. Nothing
+is fsynced: this survives a crashing process, not a power cut.
 
 `maxInflateBuffer` caps what one inflate call may allocate; larger entries
 stream instead. Lowering `maxEntryUncompressedSize` tightens it too, and `-1`
@@ -198,9 +218,9 @@ same way. `bun run bench/size.ts` regenerates this table.
 | You import | bun-zipper | fflate |
 |---|---|---|
 | create only | **3.3 kB** | 5.3 kB (`zipSync`) |
-| read only | **5.5 kB** | 5.8 kB (`unzipSync`) |
-| streaming both ways | **7.4 kB** | 7.8 kB (`Zip`/`Unzip` plus their entry classes) |
-| everything | **8.8 kB** | 12.5 kB |
+| read only | **5.6 kB** | 5.8 kB (`unzipSync`) |
+| streaming both ways | **7.5 kB** | 7.8 kB (`Zip`/`Unzip` plus their entry classes) |
+| everything | **9.9 kB** | 12.5 kB |
 
 Shipping no DEFLATE cuts the cost of creating archives by a third. Reading barely gains:
 Zip64, prepended and appended data, three filename-encoding paths, decompression

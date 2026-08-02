@@ -3,6 +3,11 @@ export class ZipError extends Error {
   readonly offset?: number;
   /** Entry name the problem belongs to, when known. */
   readonly entry?: string;
+  /**
+   * Paths `extractZip` had already written when it gave up. Extraction is not
+   * atomic, so this is how a caller learns what it has to clean up.
+   */
+  installed?: readonly string[];
 
   constructor(message: string, opts?: { offset?: number; entry?: string; cause?: unknown }) {
     // Error reads `cause` off the options bag and ignores the rest.

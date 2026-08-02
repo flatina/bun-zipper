@@ -1,7 +1,7 @@
 import type { FileHandle } from "node:fs/promises";
 import { link, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { ZipError, ZipSecurityError } from "./errors.ts";
+import { ZipError, ZipSecurityError, ZipUnsupportedError } from "./errors.ts";
 import { sanitizeEntryPath } from "./path.ts";
 import {
   TotalSizeBudget,
@@ -34,21 +34,41 @@ export async function extractZip(
   options: ExtractOptions = {},
 ): Promise<string[]> {
   const reader = await ZipReader.open(input, options);
-  await mkdir(destination, { recursive: true });
 
-  // Resolve the root once so a symlinked destination compares correctly.
-  const root = await realpath(resolve(destination));
+  // Called once and its answer kept: it is the caller's function, and calling it
+  // twice for one entry is something they can see.
+  const selected = options.filter ? reader.entries.filter(options.filter) : [...reader.entries];
+
+  const { anchor, tail, root } = await resolveRoot(destination);
+  const planned = plan(selected, reader.limits);
+  await inspectDestination(root, planned, options.overwrite === true);
+
+  // Created only once everything above has passed, so a refusal leaves the
+  // filesystem as it was — including the destination itself.
+  await mkdirInside(anchor, tail, destination);
+
   const written: string[] = [];
   const budget = new TotalSizeBudget(reader.limits.maxTotalUncompressedSize);
 
-  for (const entry of reader.entries) {
-    if (options.filter && !options.filter(entry)) continue;
+  try {
+    await write(planned, root, written, budget, options.overwrite === true);
+  } catch (error) {
+    // Without atomic staging a failure partway leaves earlier entries in place,
+    // and the caller cannot clean up what it was never told about.
+    if (error instanceof ZipError) error.installed = written;
+    throw error;
+  }
+  return written;
+}
 
-    if (entry.unixMode !== undefined && (entry.unixMode & S_IFMT) === S_IFLNK) {
-      throw new ZipSecurityError("archive contains a symbolic link", { entry: entry.name });
-    }
-
-    const relative = sanitizeEntryPath(entry.name);
+async function write(
+  planned: readonly Planned[],
+  root: string,
+  written: string[],
+  budget: TotalSizeBudget,
+  overwrite: boolean,
+): Promise<void> {
+  for (const { entry, relative, parts } of planned) {
     const target = join(root, relative);
     // Defence in depth: sanitizeEntryPath already rejected traversal, but the
     // join result is what actually gets written.
@@ -58,7 +78,6 @@ export async function extractZip(
       });
     }
 
-    const parts = relative.split("/");
     if (entry.isDirectory) {
       await mkdirInside(root, parts, entry.name);
       continue;
@@ -81,7 +100,7 @@ export async function extractZip(
       // gives no way to tell whether one of them is outside the root.
       throw new ZipSecurityError("destination path has other hard links", { entry: entry.name });
     }
-    if (!options.overwrite && existing !== undefined) {
+    if (!overwrite && existing !== undefined) {
       throw new ZipSecurityError(`refusing to overwrite ${relative}`, { entry: entry.name });
     }
 
@@ -94,10 +113,179 @@ export async function extractZip(
       });
     }
 
-    await install(entry, realParent, basename(target), budget, options.overwrite === true);
+    await install(entry, realParent, basename(target), budget, overwrite);
     written.push(target);
   }
-  return written;
+}
+
+interface Planned {
+  entry: ZipEntry;
+  relative: string;
+  parts: string[];
+}
+
+/**
+ * The destination need not exist yet, and every check below needs a resolved
+ * root. Resolve the nearest ancestor that does exist and rebuild the rest on
+ * top: components that do not exist cannot be symlinks, so the part that could
+ * lie is exactly the part being resolved.
+ */
+async function resolveRoot(
+  destination: string,
+): Promise<{ anchor: string; tail: string[]; root: string }> {
+  const wanted = resolve(destination);
+  const tail: string[] = [];
+  let at = wanted;
+  while ((await lstat(at).catch(() => undefined)) === undefined) {
+    const parent = dirname(at);
+    if (parent === at) throw new ZipError(`no existing ancestor of ${destination}`);
+    tail.unshift(basename(at));
+    at = parent;
+  }
+  const anchor = await realpath(at);
+  return { anchor, tail, root: join(anchor, ...tail) };
+}
+
+/**
+ * Case and normalization both collapse on the filesystems most callers have —
+ * NTFS folds case, APFS folds case and normalizes — so an exact-string check
+ * misses the collisions that actually happen, and misses them halfway through
+ * an extraction.
+ */
+const collationKey = (path: string): string => path.normalize("NFC").toLowerCase();
+
+/**
+ * Everything knowable from the archive alone, checked before any of it is acted
+ * on. What is left for the write loop is what only reading can discover: CRC,
+ * real sizes, malformed local headers, and IO.
+ */
+function plan(entries: readonly ZipEntry[], limits: ZipReader["limits"]): Planned[] {
+  const planned: Planned[] = [];
+  const files = new Map<string, string>();
+  const directories = new Map<string, string>();
+  let declared = 0n;
+
+  for (const entry of entries) {
+    if (entry.unixMode !== undefined && (entry.unixMode & S_IFMT) === S_IFLNK) {
+      throw new ZipSecurityError("archive contains a symbolic link", { entry: entry.name });
+    }
+    if (entry.isEncrypted) {
+      throw new ZipUnsupportedError("entry is encrypted; encryption is not supported", {
+        entry: entry.name,
+      });
+    }
+    if (!entry.isDirectory && entry.compressionMethod !== 0 && entry.compressionMethod !== 8) {
+      throw new ZipUnsupportedError(
+        `compression method ${entry.compressionMethod} is not supported (only store and deflate)`,
+        { entry: entry.name },
+      );
+    }
+    if (entry.uncompressedSize > limits.maxEntryUncompressedSize) {
+      throw new ZipSecurityError(
+        `entry is ${entry.uncompressedSize} bytes, over the ${limits.maxEntryUncompressedSize} limit`,
+        { entry: entry.name },
+      );
+    }
+    if (
+      entry.compressedSize > 0n &&
+      Number(entry.uncompressedSize) / Number(entry.compressedSize) > limits.maxCompressionRatio
+    ) {
+      throw new ZipSecurityError(
+        `compression ratio exceeds the ${limits.maxCompressionRatio}:1 limit`,
+        { entry: entry.name },
+      );
+    }
+
+    const relative = sanitizeEntryPath(entry.name);
+    const parts = relative.split("/");
+
+    // Every component above the entry is a directory, whether or not the archive
+    // says so. A name used both ways cannot be extracted, and finding that out
+    // after the file landed is the failure this exists to prevent.
+    const leaf = entry.isDirectory ? parts.length : parts.length - 1;
+    for (let i = 0; i < leaf; i++) {
+      directories.set(
+        collationKey(parts.slice(0, i + 1).join("/")),
+        parts.slice(0, i + 1).join("/"),
+      );
+    }
+    if (!entry.isDirectory) {
+      const key = collationKey(relative);
+      const clash = files.get(key);
+      if (clash !== undefined) {
+        throw new ZipError(`${entry.name} and ${clash} extract to the same path`, {
+          entry: entry.name,
+        });
+      }
+      files.set(key, entry.name);
+      declared += entry.uncompressedSize;
+      planned.push({ entry, relative, parts });
+    } else {
+      planned.push({ entry, relative, parts });
+    }
+  }
+
+  for (const [key, path] of files) {
+    if (directories.has(key)) {
+      throw new ZipError(`${path} is used as both a file and a directory`, { entry: path });
+    }
+  }
+  // Known up front, so an archive that says outright it is too big never starts.
+  if (declared > limits.maxTotalUncompressedSize) {
+    throw new ZipSecurityError(
+      `archive declares ${declared} bytes, over the ${limits.maxTotalUncompressedSize} limit`,
+    );
+  }
+  return planned;
+}
+
+/**
+ * The destination-side half, hoisted out of the write loop so a conflict at the
+ * last entry does not leave the first ones installed. The loop still repeats
+ * these: this narrows the window, it does not close it.
+ */
+async function inspectDestination(
+  root: string,
+  planned: readonly Planned[],
+  overwrite: boolean,
+): Promise<void> {
+  const seen = new Set<string>();
+  for (const { entry, relative, parts } of planned) {
+    const depth = entry.isDirectory ? parts.length : parts.length - 1;
+    let at = root;
+    for (let i = 0; i < depth; i++) {
+      at = join(at, parts[i]!);
+      if (seen.has(at)) continue;
+      seen.add(at);
+      const info = await lstat(at).catch(() => undefined);
+      if (info === undefined) continue;
+      if (info.isSymbolicLink()) {
+        throw new ZipSecurityError(`${parts[i]} is a symbolic link in the destination`, {
+          entry: entry.name,
+        });
+      }
+      if (!info.isDirectory()) {
+        throw new ZipError(`${parts[i]} exists and is not a directory`, { entry: entry.name });
+      }
+    }
+    if (entry.isDirectory) continue;
+
+    const target = join(root, relative);
+    const info = await lstat(target).catch(() => undefined);
+    if (info === undefined) continue;
+    if (info.isSymbolicLink()) {
+      throw new ZipSecurityError("destination path is a symbolic link", { entry: entry.name });
+    }
+    if (info.isDirectory()) {
+      throw new ZipError(`${relative} exists as a directory`, { entry: entry.name });
+    }
+    if (info.isFile() && info.nlink > 1) {
+      throw new ZipSecurityError("destination path has other hard links", { entry: entry.name });
+    }
+    if (!overwrite) {
+      throw new ZipSecurityError(`refusing to overwrite ${relative}`, { entry: entry.name });
+    }
+  }
 }
 
 /** Enough to make a guess useless; the name never derives from the entry. */

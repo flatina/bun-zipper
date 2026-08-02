@@ -126,6 +126,67 @@ describe("extractZip", () => {
     expect(await Bun.file(join(dir, "big.bin")).bytes()).toEqual(big);
   });
 
+  test("a bad entry stops the extraction before any entry is written", async () => {
+    // The point of preflighting: entry 1 is fine, entry 2 is not, and neither
+    // lands. The destination itself is not created either.
+    const target = join(dir, "into");
+    const archive = await zip({ "fine.txt": "x", "../escape.txt": "no" });
+    await expect(extractZip(archive, target)).rejects.toThrow(ZipSecurityError);
+    expect(await Bun.file(target).exists()).toBe(false);
+  });
+
+  test("paths that collide only by case or normalization are refused", async () => {
+    for (const names of [
+      ["a.txt", "A.TXT"],
+      ["café.txt".normalize("NFC"), "café.txt".normalize("NFD")],
+    ]) {
+      const sink = new MemorySink();
+      const writer = new ZipWriter(sink);
+      for (const name of names) await writer.add(name, "x");
+      await writer.close();
+      await expect(extractZip(sink.toBytes(), dir)).rejects.toThrow(/same path/);
+    }
+  });
+
+  test("a name used as both a file and a directory is refused", async () => {
+    await expect(extractZip(await zip({ a: "file", "a/b.txt": "child" }), dir)).rejects.toThrow(
+      /both a file and a directory/,
+    );
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  test("an archive that declares more than the total limit never starts", async () => {
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 10; i++) files[`f${i}.txt`] = "x".repeat(2000);
+    await expect(
+      extractZip(await zip(files), dir, {
+        limits: { maxTotalUncompressedSize: 5000n, maxCompressionRatio: Number.MAX_SAFE_INTEGER },
+      }),
+    ).rejects.toThrow(ZipSecurityError);
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  test("a failure reports what it already wrote", async () => {
+    await Bun.write(join(dir, "second.txt"), "existing");
+    let error: ZipSecurityError | undefined;
+    await extractZip(await zip({ "first.txt": "a", "second.txt": "b" }), dir).catch((e) => {
+      error = e as ZipSecurityError;
+    });
+    // Refused at preflight, so nothing was written and nothing is claimed.
+    expect(error?.installed ?? []).toEqual([]);
+  });
+
+  test("filter is consulted once per entry", async () => {
+    const seen: string[] = [];
+    await extractZip(await zip({ "a.txt": "1", "b.txt": "2" }), dir, {
+      filter: (entry) => {
+        seen.push(entry.name);
+        return entry.name === "a.txt";
+      },
+    });
+    expect(seen).toEqual(["a.txt", "b.txt"]);
+  });
+
   test("filter skips entries", async () => {
     const archive = await zip({ "keep.txt": "yes", "skip.bin": "no" });
     const written = await extractZip(archive, dir, {

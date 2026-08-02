@@ -14,7 +14,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 /** Gzipped bytes for the whole API. Raise deliberately; a silent drift is the thing to catch. */
-const CEILING = 9_000;
+const CEILING = 10_500;
 
 const ROOT = join(import.meta.dir, "..");
 const STAGING = join(ROOT, ".tmp/size-entries");
