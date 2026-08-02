@@ -150,6 +150,10 @@ in place. The error carries an `installed` array — every path the call created
 directories included, in the order it created them, so undoing it means walking
 that backwards. Extract to a scratch directory if you need all-or-nothing.
 
+Both that array and the return value hold resolved paths, not the destination as
+you spelled it: a symlinked or 8.3-shortened destination comes back as where the
+files actually are.
+
 Putting an entry in place replaces the inode rather than truncating a file, so
 mode, ownership and ACLs come from the new file, readers holding the old one keep
 seeing it, and on Windows a target another process holds open will fail. Nothing

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { link, mkdtemp, readdir, rm, symlink } from "node:fs/promises";
+import { link, mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -214,11 +214,15 @@ describe("extractZip", () => {
       error = e as ZipCrcError;
     });
 
+    // Resolved paths, as everything extractZip reports is: the Windows runner
+    // hands out an 8.3 tmpdir and macOS aliases /var, and a caller cleaning up
+    // needs where the files are rather than how it spelled the destination.
+    const root = await realpath(dir);
     // Cleaning up only the files would leave "into" and "into/d" behind.
     expect(error?.installed).toEqual([
-      join(dir, "into"),
-      join(dir, "into", "d"),
-      join(dir, "into", "d", "first.txt"),
+      join(root, "into"),
+      join(root, "into", "d"),
+      join(root, "into", "d", "first.txt"),
     ]);
   });
 
