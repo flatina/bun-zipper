@@ -213,6 +213,9 @@ describe("unsupported features", () => {
     patched[centralFlagOffset] = patched[centralFlagOffset]! | 0x01;
     const reader = await ZipReader.open(patched);
     expect(reader.entries).toHaveLength(1);
+    // Surfaced rather than only thrown, so a caller can check an archive over
+    // before committing to extracting any of it.
+    expect(reader.entries[0]!.isEncrypted).toBe(true);
     await expect(reader.entries[0]!.bytes()).rejects.toThrow(ZipUnsupportedError);
   });
 

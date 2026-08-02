@@ -172,6 +172,11 @@ export interface ZipEntry {
    * anything else is surfaced here and refused when the data is requested.
    */
   readonly compressionMethod: number;
+  /**
+   * Surfaced for the same reason as the method: reading is refused, but a caller
+   * checking an archive over before extracting it needs to know why.
+   */
+  readonly isEncrypted: boolean;
   readonly compressedSize: bigint;
   readonly uncompressedSize: bigint;
   readonly crc32: number;
@@ -673,6 +678,7 @@ function makeEntry(
     rawName: record.rawName,
     comment: record.comment,
     compressionMethod: record.method,
+    isEncrypted: (record.flags & FLAG_ENCRYPTED) !== 0,
     compressedSize: record.compressedSize,
     uncompressedSize: record.uncompressedSize,
     crc32: record.crc32,
