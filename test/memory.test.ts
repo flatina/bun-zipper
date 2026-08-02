@@ -22,9 +22,9 @@ let probe = "";
 const PROBE = `
 import { ZipReader } from ${JSON.stringify(join(import.meta.dir, "../src/index.ts"))};
 
-const [archive, mode] = Bun.argv.slice(2);
+const archive = Bun.argv[2];
 
-async function read() {
+async function read(mode) {
   const entry = (await ZipReader.open(Bun.file(archive))).get("big.bin")!;
   if (mode === "bytes") return (await entry.bytes()).length;
   let counted = 0;
@@ -34,24 +34,32 @@ async function read() {
   return counted;
 }
 
+async function peakGrowth(mode) {
+  Bun.gc(true);
+  const before = process.memoryUsage().rss;
+  let peak = 0;
+  // The sampler collects first — rss counts pages the allocator has not returned,
+  // and a loop this tight outruns the collector.
+  const sampler = setInterval(() => {
+    Bun.gc(false);
+    peak = Math.max(peak, process.memoryUsage().rss - before);
+  }, 5);
+  const counted = await read(mode);
+  clearInterval(sampler);
+  return { counted, peak: Math.max(peak, process.memoryUsage().rss - before) };
+}
+
 // Warm up first: the earliest allocations of a process grow the heap on their
 // own, which would be measured as this package holding memory.
-await read();
+await read("stream");
 
-Bun.gc(true);
-const before = process.memoryUsage().rss;
-let peak = 0;
-// The sampler collects first — rss counts pages the allocator has not returned,
-// and a loop this tight outruns the collector.
-const sampler = setInterval(() => {
-  Bun.gc(false);
-  peak = Math.max(peak, process.memoryUsage().rss - before);
-}, 5);
-const counted = await read();
-clearInterval(sampler);
-peak = Math.max(peak, process.memoryUsage().rss - before);
+// Streaming is measured first, from the colder heap. Doing it after bytes()
+// would measure it against pages that allocation already claimed, which flatters
+// it into passing whatever it does.
+const stream = await peakGrowth("stream");
+const bytes = await peakGrowth("bytes");
 
-console.log(JSON.stringify({ counted, peak }));
+console.log(JSON.stringify({ stream, bytes }));
 `;
 
 beforeAll(async () => {
@@ -82,8 +90,10 @@ afterAll(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-async function measure(mode: "stream" | "bytes"): Promise<{ counted: number; peak: number }> {
-  const child = Bun.spawn([process.execPath, probe, archive, mode], {
+type Reading = { counted: number; peak: number };
+
+async function measure(): Promise<{ stream: Reading; bytes: Reading }> {
+  const child = Bun.spawn([process.execPath, probe, archive], {
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -95,16 +105,17 @@ async function measure(mode: "stream" | "bytes"): Promise<{ counted: number; pea
   return JSON.parse(out);
 }
 
-test("stream() holds chunks, not the entry", async () => {
-  const { counted, peak } = await measure("stream");
-  expect(counted).toBe(ENTRY_SIZE);
-  // Generous: runners are noisy and the shape is the point, not the constant.
-  // Measured near 1 MB, and holding the entry would land at 64.
-  expect(peak).toBeLessThan(ENTRY_SIZE / 8);
-}, 120_000);
+test("stream() holds chunks where bytes() holds the entry", async () => {
+  const { stream, bytes } = await measure();
+  expect(stream.counted).toBe(ENTRY_SIZE);
+  expect(bytes.counted).toBe(ENTRY_SIZE);
 
-test("bytes() does hold the entry, so the check above can fail", async () => {
-  const { counted, peak } = await measure("bytes");
-  expect(counted).toBe(ENTRY_SIZE);
-  expect(peak).toBeGreaterThan(ENTRY_SIZE / 4);
+  // Compared against each other rather than against a constant: rss on a CI
+  // runner carries 8-10 MB of noise that has nothing to do with this package,
+  // and an absolute bound near that floor fails on the noise instead of on the
+  // behaviour. Both readings carry it, so the comparison cancels it.
+  expect(stream.peak * 3).toBeLessThan(bytes.peak);
+  // And bytes() really does hold the entry, which is what makes the line above
+  // able to fail at all.
+  expect(bytes.peak).toBeGreaterThan(ENTRY_SIZE / 4);
 }, 120_000);
