@@ -6,8 +6,11 @@ export class ZipError extends Error {
   /**
    * Every path `extractZip` created before it gave up, in that order, so undoing
    * a half-done extraction means walking it backwards. Extraction is not atomic;
-   * this is how a caller learns what is on disk. Present on any failure from
-   * `extractZip`, absent everywhere else.
+   * this is how a caller learns what is on disk.
+   *
+   * Set on whatever `extractZip` throws. A callback of the caller's that throws
+   * a frozen error or a bare string leaves nowhere to record it, so treat it as
+   * optional rather than guaranteed.
    */
   installed?: readonly string[];
 

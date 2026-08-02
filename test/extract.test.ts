@@ -294,16 +294,40 @@ describe("extractZip", () => {
     );
   });
 
-  test("every failure carries installed, whatever threw", async () => {
-    // The destination is a file, so this fails inside resolveRoot — before the
-    // write loop, and from a path that used to produce a raw fs error.
+  test("installed rides on whatever was thrown, and never replaces it", async () => {
     await Bun.write(join(dir, "occupied"), "x");
-    let error: ZipError | undefined;
+    // A ZipError from before the write loop.
+    let refusal: ZipError | undefined;
     await extractZip(await zip({ "a.txt": "x" }), join(dir, "occupied")).catch((e) => {
-      error = e as ZipError;
+      refusal = e as ZipError;
     });
-    expect(error).toBeInstanceOf(ZipError);
-    expect(error?.installed).toEqual([]);
+    expect(refusal).toBeInstanceOf(ZipError);
+    expect(refusal?.installed).toEqual([]);
+
+    // Something the caller threw that cannot carry the annotation. Losing the
+    // list is a nuisance; losing their error would hide why it stopped.
+    const frozen = Object.freeze(new Error("from the filter"));
+    let thrown: unknown;
+    await extractZip(await zip({ "a.txt": "x" }), join(dir, "out"), {
+      filter: () => {
+        throw frozen;
+      },
+    }).catch((e) => {
+      thrown = e;
+    });
+    expect(thrown).toBe(frozen);
+    expect((thrown as Error).message).toBe("from the filter");
+
+    // And a primitive, which has nowhere to put it either.
+    let primitive: unknown;
+    await extractZip(await zip({ "a.txt": "x" }), join(dir, "out2"), {
+      filter: () => {
+        throw "a string";
+      },
+    }).catch((e) => {
+      primitive = e;
+    });
+    expect(primitive).toBe("a string");
   });
 
   test("filter is consulted once per entry", async () => {

@@ -116,7 +116,8 @@ much as the destination directory, and refuses:
 - declared sizes over the per-entry, ratio, or archive-wide limits
 - paths that pass through a symlink or junction already in the destination —
   directories are created one component at a time so none is followed
-- targets that carry other hard links, since writing through one edits them all
+- targets that carry other hard links: installing replaces the name rather than
+  the file, so the other names would silently stop tracking this one
 - overwriting an existing file, unless `overwrite: true`
 
 Each entry is written to a temporary file beside its target and put in place only

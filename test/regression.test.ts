@@ -383,7 +383,10 @@ describe("corrupt deflate", () => {
     // through, which made the library's worst failure its least legible.
     const small = mangle((await zip({ "s.bin": "hello world ".repeat(5_000) })).slice(), 16);
     const buffered = await ZipReader.open(small);
-    await expect(buffered.entries[0]!.bytes()).rejects.toThrow(/deflate stream is corrupt/);
+    const first = (await buffered.entries[0]!.bytes().catch((e) => e)) as ZipFormatError;
+    expect(first).toBeInstanceOf(ZipFormatError);
+    expect(first.message).toMatch(/deflate stream is corrupt/);
+    expect(first.entry).toBe("s.bin");
 
     const large = mangle(
       (await zip({ "b.bin": "the quick brown fox ".repeat(200_000) })).slice(),
@@ -391,11 +394,12 @@ describe("corrupt deflate", () => {
     );
     const streamed = await ZipReader.open(large);
     const chunks = (await streamed.entries[0]!.stream()) as unknown as AsyncIterable<Uint8Array>;
-    await expect(
-      (async () => {
-        for await (const _ of chunks);
-      })(),
-    ).rejects.toThrow(/deflate stream is corrupt/);
+    const second = (await (async () => {
+      for await (const _ of chunks);
+    })().catch((e) => e)) as ZipFormatError;
+    expect(second).toBeInstanceOf(ZipFormatError);
+    expect(second.message).toMatch(/deflate stream is corrupt/);
+    expect(second.entry).toBe("b.bin");
   });
 });
 

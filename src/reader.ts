@@ -831,7 +831,12 @@ function namedInflateErrors(
         if (done) controller.close();
         else controller.enqueue(value);
       } catch (cause) {
-        throw wrapInflateError(cause, entry);
+        // Reads reach here too — the archive being deleted mid-stream arrives
+        // as an ENOENT through the same reader. Only the decompressor's own
+        // failure is translated; anything else keeps its code and its message.
+        const code = (cause as { code?: string } | undefined)?.code;
+        const fromInflate = cause instanceof TypeError || code?.startsWith("Z_") === true;
+        throw fromInflate ? wrapInflateError(cause, entry) : cause;
       }
     },
     cancel(reason) {

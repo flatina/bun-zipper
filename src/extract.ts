@@ -77,9 +77,7 @@ export async function extractZip(
     // a caller acts on. Without atomic staging a failure partway leaves earlier
     // entries in place, and the caller cannot clean up what it was never told
     // about.
-    if (typeof error === "object" && error !== null) {
-      (error as { installed?: readonly string[] }).installed = created;
-    }
+    annotate(error, created);
     throw error;
   }
   return written;
@@ -118,6 +116,11 @@ async function write(
     if (existing?.isDirectory()) {
       throw new ZipError(`${relative} exists as a directory`, { entry: entry.name });
     }
+    // Ahead of the hard-link check: when the file is simply already there, that
+    // is the answer, and its link count is beside the point.
+    if (!overwrite && existing !== undefined) {
+      throw new ZipSecurityError(`refusing to overwrite ${relative}`, { entry: entry.name });
+    }
     // Regular files only: POSIX counts "." and each subdirectory as links, so
     // every directory has an nlink above 1 and would look like a hard link.
     if (existing?.isFile() && existing.nlink > 1) {
@@ -126,9 +129,6 @@ async function write(
       // silently: the caller had one file under several names and would be left
       // with two different files and no indication.
       throw new ZipSecurityError("destination path has other hard links", { entry: entry.name });
-    }
-    if (!overwrite && existing !== undefined) {
-      throw new ZipSecurityError(`refusing to overwrite ${relative}`, { entry: entry.name });
     }
 
     // Last line of defence: mkdirInside refuses symlinked components, but the
@@ -344,12 +344,29 @@ async function inspectDestination(
     if (info.isDirectory()) {
       throw new ZipError(`${relative} exists as a directory`, { entry: entry.name });
     }
-    if (info.isFile() && info.nlink > 1) {
-      throw new ZipSecurityError("destination path has other hard links", { entry: entry.name });
-    }
+    // Ahead of the hard-link check: when the file is simply already there, that
+    // is the answer, and its link count is beside the point.
     if (!overwrite) {
       throw new ZipSecurityError(`refusing to overwrite ${relative}`, { entry: entry.name });
     }
+    if (info.isFile() && info.nlink > 1) {
+      throw new ZipSecurityError("destination path has other hard links", { entry: entry.name });
+    }
+  }
+}
+
+/**
+ * Records the cleanup list on the error being thrown. A caller's callback may
+ * throw a frozen error or a string, and neither can carry it — losing the list
+ * is a nuisance, but replacing their exception with a `TypeError` about a
+ * read-only property would lose the reason the extraction failed at all.
+ */
+function annotate(error: unknown, installed: readonly string[]): void {
+  if (typeof error !== "object" || error === null) return;
+  try {
+    (error as { installed?: readonly string[] }).installed = installed;
+  } catch {
+    // Frozen or sealed; the original error matters more than the annotation.
   }
 }
 
