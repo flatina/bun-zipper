@@ -118,6 +118,32 @@ describe("extraction matches the archive", () => {
     return out;
   }
 
+  /**
+   * Names that are legal in a ZIP and mean different things per filesystem. The
+   * verdict has to be the same everywhere, so these run on all three CI
+   * platforms and the assertion is refusal, not a particular error.
+   */
+  const AMBIGUOUS = [
+    ["A.txt", "a.txt"],
+    ["A/x.txt", "a/y.txt"],
+    ["dir/f.txt", "DIR/g.txt"],
+    ["café.txt".normalize("NFC"), "café.txt".normalize("NFD")],
+    ["x", "x/y.txt"],
+    ["a/b", "a/b/c.txt"],
+  ];
+
+  test("names that fold together are refused, on whatever filesystem", async () => {
+    for (const [first, second] of AMBIGUOUS) {
+      const files: Record<string, string> = {};
+      files[first!] = "1";
+      files[second!] = "2";
+      await expect(extractZip(await zip(files), join(dir, "x"))).rejects.toThrow();
+      // Refused as a whole: a partial extraction is the outcome that differs by
+      // platform, which is what makes it worse than failing.
+      expect(await Bun.file(join(dir, "x")).exists()).toBe(false);
+    }
+  });
+
   test("what fflate wrote extracts to the same tree", async () => {
     for (const seed of SEEDS.slice(0, 10)) {
       const files = tree(seed);

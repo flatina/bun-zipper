@@ -59,14 +59,18 @@ export async function extractZip(
     // filesystem as it was — including the destination itself.
     await mkdirInside(anchor, tail, destination, created);
     await write(planned, root, written, created, budget, options.overwrite === true);
-  } catch (error) {
+  } catch (cause) {
+    // Filesystem failures are the ones most likely to strike halfway, and they
+    // arrive as themselves — a bare ENOSPC, or the empty TypeError the runtime
+    // raises on a corrupt deflate stream. Wrapped so one catch covers every way
+    // this call can fail and `installed` is always there to read.
+    const error =
+      cause instanceof ZipError
+        ? cause
+        : new ZipError(`extraction failed: ${(cause as Error)?.message ?? cause}`, { cause });
     // Without atomic staging a failure partway leaves earlier entries in place,
-    // and the caller cannot clean up what it was never told about. Filesystem
-    // errors arrive as themselves, not as ZipError, and they are the ones most
-    // likely to strike halfway.
-    if (typeof error === "object" && error !== null) {
-      (error as { installed?: readonly string[] }).installed = created;
-    }
+    // and the caller cannot clean up what it was never told about.
+    error.installed = created;
     throw error;
   }
   return written;

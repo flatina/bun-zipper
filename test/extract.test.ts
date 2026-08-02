@@ -6,6 +6,7 @@ import {
   extractZip,
   MemorySink,
   ZipCrcError,
+  ZipError,
   ZipSecurityError,
   ZipWriter,
   zip,
@@ -247,6 +248,44 @@ describe("extractZip", () => {
     });
     // Refused at preflight, so nothing was written and nothing is claimed.
     expect(error?.installed ?? []).toEqual([]);
+  });
+
+  test("a destination reached through a symlink is legal", async () => {
+    // macOS resolves /tmp through one, so refusing this would refuse the most
+    // ordinary destination there is. Only components *under* the root are barred.
+    const real = await mkdtemp(join(tmpdir(), "bun-zipper-real-"));
+    try {
+      await symlink(real, join(dir, "via"), "junction");
+      await extractZip(await zip({ "a/b.txt": "x" }), join(dir, "via", "out"));
+      expect(await Bun.file(join(real, "out", "a", "b.txt")).text()).toBe("x");
+    } finally {
+      await rm(real, { recursive: true, force: true });
+    }
+  });
+
+  test("a destination several levels deep is created, and only then", async () => {
+    const deep = join(dir, "one", "two", "three");
+    await extractZip(await zip({ "f.txt": "x" }), deep);
+    expect(await Bun.file(join(deep, "f.txt")).text()).toBe("x");
+  });
+
+  test("a destination that is a file is refused before anything else happens", async () => {
+    await Bun.write(join(dir, "occupied"), "i am a file");
+    await expect(extractZip(await zip({ "a.txt": "x" }), join(dir, "occupied"))).rejects.toThrow(
+      /not a directory/,
+    );
+  });
+
+  test("every failure carries installed, whatever threw", async () => {
+    // The destination is a file, so this fails inside resolveRoot — before the
+    // write loop, and from a path that used to produce a raw fs error.
+    await Bun.write(join(dir, "occupied"), "x");
+    let error: ZipError | undefined;
+    await extractZip(await zip({ "a.txt": "x" }), join(dir, "occupied")).catch((e) => {
+      error = e as ZipError;
+    });
+    expect(error).toBeInstanceOf(ZipError);
+    expect(error?.installed).toEqual([]);
   });
 
   test("filter is consulted once per entry", async () => {

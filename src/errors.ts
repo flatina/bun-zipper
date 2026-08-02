@@ -4,8 +4,10 @@ export class ZipError extends Error {
   /** Entry name the problem belongs to, when known. */
   readonly entry?: string;
   /**
-   * Paths `extractZip` had already written when it gave up. Extraction is not
-   * atomic, so this is how a caller learns what it has to clean up.
+   * Every path `extractZip` created before it gave up, in that order, so undoing
+   * a half-done extraction means walking it backwards. Extraction is not atomic;
+   * this is how a caller learns what is on disk. Present on any failure from
+   * `extractZip`, absent everywhere else.
    */
   installed?: readonly string[];
 
