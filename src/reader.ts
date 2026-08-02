@@ -4,6 +4,7 @@ import {
   inflateCapped,
   inflateTransform,
   worstCaseInflatedSize,
+  wrapInflateError,
 } from "./compress.ts";
 import { decodeName } from "./cp437.ts";
 import { Crc32, crc32 } from "./crc32.ts";
@@ -757,7 +758,10 @@ function makeEntry(
       if (isDirectory) return new Blob([]).stream();
       checkReadable();
       const raw = await compressedStream();
-      const plain = record.method === METHOD_STORE ? raw : raw.pipeThrough(inflateTransform());
+      const plain =
+        record.method === METHOD_STORE
+          ? raw
+          : namedInflateErrors(raw.pipeThrough(inflateTransform()), record.name);
       return plain.pipeThrough(verifyTransform(record, outputCap(), verifyCrc, onCrcMismatch));
     },
   };
@@ -807,6 +811,33 @@ async function findDataStart(
     start: localOffset + LOCAL_HEADER_SIZE + nameLength + extraLength,
     localCrc: localCrc === 0 ? undefined : localCrc,
   };
+}
+
+/**
+ * The runtime reports a corrupt deflate stream as a bare `TypeError` with an
+ * empty message. The buffered path already translates that; without the same
+ * here, the streamed path is the one failure in the library that arrives with
+ * nothing to read and no entry attached.
+ */
+function namedInflateErrors(
+  source: ReadableStream<Uint8Array>,
+  entry: string,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (cause) {
+        throw wrapInflateError(cause, entry);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
 }
 
 function verifyTransform(

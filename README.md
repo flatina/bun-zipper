@@ -131,6 +131,11 @@ Peak memory per entry is a block, except where the payload itself cannot exceed
 one: those are inflated in a single call, which is faster. The test is what the
 compressed bytes could produce, never what the header declares.
 
+That safety costs syscalls. Extraction went from roughly three per entry to
+eight, and archives of many small files are about twice as slow as they were in
+0.2: 2000 × 1 KB takes 1.9 s here where it took 1.0 s. Large entries are limited
+by the decompressor rather than the syscalls and cost far less.
+
 `limits` has safe defaults: `maxEntries`, `maxEntryUncompressedSize`,
 `maxTotalUncompressedSize`, `maxCompressionRatio`. `unzip` and `extractZip`
 additionally enforce the cumulative one — per-entry caps cannot stop an archive

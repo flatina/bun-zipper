@@ -367,6 +367,38 @@ describe("path rules that only bite on Windows", () => {
   });
 });
 
+describe("corrupt deflate", () => {
+  /** Wrecks the huffman data a few bytes into the payload of the first entry. */
+  function mangle(archive: Uint8Array, run: number): Uint8Array {
+    const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+    const local = findSignature(archive, SIG_LOCAL);
+    const at = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
+    for (let i = 0; i < run; i++) archive[at + 8 + i] = 0xff;
+    return archive;
+  }
+
+  test("both read paths name the entry and say what happened", async () => {
+    // The runtime reports this as a TypeError with an empty message. The
+    // buffered path always translated it; the streamed one used to pass it
+    // through, which made the library's worst failure its least legible.
+    const small = mangle((await zip({ "s.bin": "hello world ".repeat(5_000) })).slice(), 16);
+    const buffered = await ZipReader.open(small);
+    await expect(buffered.entries[0]!.bytes()).rejects.toThrow(/deflate stream is corrupt/);
+
+    const large = mangle(
+      (await zip({ "b.bin": "the quick brown fox ".repeat(200_000) })).slice(),
+      64,
+    );
+    const streamed = await ZipReader.open(large);
+    const chunks = (await streamed.entries[0]!.stream()) as unknown as AsyncIterable<Uint8Array>;
+    await expect(
+      (async () => {
+        for await (const _ of chunks);
+      })(),
+    ).rejects.toThrow(/deflate stream is corrupt/);
+  });
+});
+
 describe("16-bit field limits", () => {
   test("a name at the limit round-trips; one byte over is refused", async () => {
     const atLimit = "x".repeat(0xffff);

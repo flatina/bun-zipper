@@ -19,8 +19,17 @@ const S_IFLNK = 0o120000;
 /** Write granularity, matching the reader's own slice size. */
 const WRITE_BLOCK = 1024 * 1024;
 
-/** What a filesystem without hard links answers `link` with. */
-const NO_HARD_LINKS = new Set(["EPERM", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EMLINK", "EXDEV"]);
+/** What a filesystem without hard links answers `link` with; SMB adds the last two. */
+const NO_HARD_LINKS = new Set([
+  "EPERM",
+  "ENOSYS",
+  "ENOTSUP",
+  "EOPNOTSUPP",
+  "EMLINK",
+  "EXDEV",
+  "EACCES",
+  "EINVAL",
+]);
 
 export interface ExtractOptions extends ZipReaderOptions {
   /** Off by default, so extraction cannot clobber. */
@@ -62,18 +71,15 @@ export async function extractZip(
     // filesystem as it was — including the destination itself.
     await mkdirInside(anchor, tail, destination, created);
     await write(planned, root, written, created, budget, options.overwrite === true);
-  } catch (cause) {
-    // Filesystem failures are the ones most likely to strike halfway, and they
-    // arrive as themselves — a bare ENOSPC, or the empty TypeError the runtime
-    // raises on a corrupt deflate stream. Wrapped so one catch covers every way
-    // this call can fail and `installed` is always there to read.
-    const error =
-      cause instanceof ZipError
-        ? cause
-        : new ZipError(`extraction failed: ${(cause as Error)?.message ?? cause}`, { cause });
-    // Without atomic staging a failure partway leaves earlier entries in place,
-    // and the caller cannot clean up what it was never told about.
-    error.installed = created;
+  } catch (error) {
+    // Attached to whatever was thrown rather than wrapped around it: replacing
+    // the error would cost a filesystem failure its `code`, which is the thing
+    // a caller acts on. Without atomic staging a failure partway leaves earlier
+    // entries in place, and the caller cannot clean up what it was never told
+    // about.
+    if (typeof error === "object" && error !== null) {
+      (error as { installed?: readonly string[] }).installed = created;
+    }
     throw error;
   }
   return written;
@@ -115,8 +121,10 @@ async function write(
     // Regular files only: POSIX counts "." and each subdirectory as links, so
     // every directory has an nlink above 1 and would look like a hard link.
     if (existing?.isFile() && existing.nlink > 1) {
-      // Writing through one edits every other name for the same file, and lstat
-      // gives no way to tell whether one of them is outside the root.
+      // Installing replaces the name rather than the file, so this is no longer
+      // about writing through to the other names. What it stops is doing that
+      // silently: the caller had one file under several names and would be left
+      // with two different files and no indication.
       throw new ZipSecurityError("destination path has other hard links", { entry: entry.name });
     }
     if (!overwrite && existing !== undefined) {
@@ -464,15 +472,11 @@ async function install(
       note(target, "target");
       const stray = temp;
       temp = "";
-      // Not suppressed, and reported first: a leftover hard link holding the
-      // whole payload that the caller is never told about is worse than a noisy
-      // failure, and cleaning up by walking the report would miss it.
-      try {
-        await unlink(stray);
-      } catch (error) {
-        note(stray, "stray");
-        throw error;
-      }
+      // The entry is installed and correct; a transient lock on the second name
+      // — an antivirus scanner on Windows is the usual one — must not turn that
+      // into a failed extraction. Reported instead, so a later failure hands the
+      // caller a path it can remove.
+      await unlink(stray).catch(() => note(stray, "stray"));
     }
   } finally {
     // Closing may throw; the temp still has to go, and neither failure may
