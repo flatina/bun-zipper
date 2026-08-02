@@ -158,6 +158,24 @@ describe("extractZip", () => {
     }
   });
 
+  test("a deeply nested name costs its own length, not its length squared", async () => {
+    // 16,000 components is a legal ZIP name. Keeping every growing prefix of it
+    // cost the better part of a gigabyte for this one entry.
+    const name = `${Array.from({ length: 16_000 }, () => "a").join("/")}/f.txt`;
+    const sink = new MemorySink();
+    const writer = new ZipWriter(sink);
+    await writer.add(name, "x");
+    // Refused during preflight, so the cost measured is deciding about the name
+    // rather than creating 16,000 directories on disk.
+    await writer.add("../escape.txt", "x");
+    await writer.close();
+
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    await expect(extractZip(sink.toBytes(), join(dir, "deep"))).rejects.toThrow(ZipSecurityError);
+    expect(process.memoryUsage().rss - before).toBeLessThan(64 * 1024 * 1024);
+  });
+
   test("a name used as both a file and a directory is refused", async () => {
     await expect(extractZip(await zip({ a: "file", "a/b.txt": "child" }), dir)).rejects.toThrow(
       /both a file and a directory/,

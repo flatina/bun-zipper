@@ -38,19 +38,22 @@ export async function extractZip(
   destination: string,
   options: ExtractOptions = {},
 ): Promise<string[]> {
-  const reader = await ZipReader.open(input, options);
-
-  // Called once and its answer kept: it is the caller's function, and calling it
-  // twice for one entry is something they can see.
-  const selected = options.filter ? reader.entries.filter(options.filter) : [...reader.entries];
-
   const written: string[] = [];
   // Everything this call brought into being, directories included, in the order
   // it happened. Undoing a half-done extraction means walking it backwards.
   const created: string[] = [];
-  const budget = new TotalSizeBudget(reader.limits.maxTotalUncompressedSize);
 
   try {
+    // Opening and filtering are inside: a malformed archive and a throwing
+    // filter are both failures of this call, and the guarantee is that every
+    // one of them carries `installed`.
+    const reader = await ZipReader.open(input, options);
+
+    // The filter is called once and its answer kept: it is the caller's
+    // function, and calling it twice for one entry is something they can see.
+    const selected = options.filter ? reader.entries.filter(options.filter) : [...reader.entries];
+    const budget = new TotalSizeBudget(reader.limits.maxTotalUncompressedSize);
+
     const { anchor, tail, root } = await resolveRoot(destination);
     const planned = plan(selected, reader.limits);
     await inspectDestination(root, planned, options.overwrite === true);
@@ -129,9 +132,9 @@ async function write(
       });
     }
 
-    await install(entry, realParent, basename(target), budget, overwrite, () => {
-      written.push(target);
-      created.push(target);
+    await install(entry, realParent, basename(target), budget, overwrite, (path, kind) => {
+      if (kind === "target") written.push(target);
+      created.push(path);
     });
   }
 }
@@ -140,6 +143,15 @@ interface Planned {
   entry: ZipEntry;
   relative: string;
   parts: string[];
+}
+
+/** One node per path component, keyed by its collation key among its siblings. */
+interface Node {
+  children: Map<string, Node>;
+  /** The component as the archive spelled it, to name the other half of a clash. */
+  component: string;
+  kind?: "file" | "directory";
+  owner?: string;
 }
 
 /**
@@ -189,8 +201,7 @@ const collationKey = (path: string): string => path.normalize("NFC").toLowerCase
  */
 function plan(entries: readonly ZipEntry[], limits: ZipReader["limits"]): Planned[] {
   const planned: Planned[] = [];
-  const files = new Map<string, string>();
-  const directories = new Map<string, string>();
+  const tree: Node = { children: new Map(), component: "" };
   let declared = 0n;
 
   for (const entry of entries) {
@@ -232,44 +243,49 @@ function plan(entries: readonly ZipEntry[], limits: ZipReader["limits"]): Planne
     const relative = sanitizeEntryPath(entry.name);
     const parts = relative.split("/");
 
-    // Every component above the entry is a directory, whether or not the archive
-    // says so. A name used both ways cannot be extracted, and finding that out
-    // after the file landed is the failure this exists to prevent.
-    const leaf = entry.isDirectory ? parts.length : parts.length - 1;
-    for (let i = 0; i < leaf; i++) {
-      const path = parts.slice(0, i + 1).join("/");
-      const key = collationKey(path);
-      const clash = directories.get(key);
-      // Two components that fold together are one directory on NTFS and APFS
-      // and two on ext4 — the archive unpacking differently depending on where
-      // is the thing this exists to stop.
-      if (clash !== undefined && clash !== path) {
-        throw new ZipError(`${path} and ${clash} extract to the same directory`, {
+    // Walked one component at a time rather than by growing prefixes: a legal
+    // 32 KB name of short components has 16,000 prefixes, and keeping them all
+    // costs the better part of a gigabyte for one entry. A tree stores each
+    // component once.
+    let node = tree;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]!;
+      const isLeaf = i === parts.length - 1;
+      const key = collationKey(part);
+      let child = node.children.get(key);
+      if (child === undefined) {
+        child = { children: new Map(), component: part };
+        node.children.set(key, child);
+      } else if (child.component !== part) {
+        // Two components that fold together are one name on NTFS and APFS and
+        // two on ext4 — the archive unpacking differently depending on where is
+        // the thing this exists to stop.
+        const what = isLeaf && !entry.isDirectory ? "path" : "directory";
+        throw new ZipError(`${part} and ${child.component} extract to the same ${what}`, {
           entry: entry.name,
         });
       }
-      directories.set(key, path);
-    }
-    if (!entry.isDirectory) {
-      const key = collationKey(relative);
-      const clash = files.get(key);
-      if (clash !== undefined) {
-        throw new ZipError(`${entry.name} and ${clash} extract to the same path`, {
-          entry: entry.name,
-        });
-      }
-      files.set(key, entry.name);
-      declared += entry.uncompressedSize;
-      planned.push({ entry, relative, parts });
-    } else {
-      planned.push({ entry, relative, parts });
-    }
-  }
+      node = child;
 
-  for (const [key, path] of files) {
-    if (directories.has(key)) {
-      throw new ZipError(`${path} is used as both a file and a directory`, { entry: path });
+      // Every component above the entry is a directory, whether or not the
+      // archive says so.
+      const kind = isLeaf && !entry.isDirectory ? "file" : "directory";
+      if (node.kind === undefined) {
+        node.kind = kind;
+        node.owner = entry.name;
+      } else if (node.kind !== kind) {
+        throw new ZipError(`${entry.name} is used as both a file and a directory`, {
+          entry: entry.name,
+        });
+      } else if (kind === "file") {
+        throw new ZipError(`${entry.name} and ${node.owner} extract to the same path`, {
+          entry: entry.name,
+        });
+      }
     }
+
+    if (!entry.isDirectory) declared += entry.uncompressedSize;
+    planned.push({ entry, relative, parts });
   }
   // Known up front, so an archive that says outright it is too big never starts.
   if (declared > limits.maxTotalUncompressedSize) {
@@ -350,7 +366,7 @@ async function install(
   name: string,
   budget: TotalSizeBudget,
   overwrite: boolean,
-  commit: () => void,
+  note: (path: string, kind: "target" | "stray") => void,
 ): Promise<void> {
   let temp = "";
   let handle: FileHandle | undefined;
@@ -421,7 +437,7 @@ async function install(
     if (overwrite) {
       await rename(temp, target);
       temp = "";
-      commit();
+      note(target, "target");
     } else {
       // `link` refuses with EEXIST rather than replacing, which is the only way
       // this option is a guarantee instead of a check someone can race. The
@@ -439,23 +455,34 @@ async function install(
         if (!NO_HARD_LINKS.has(code ?? "")) throw error;
         await rename(temp, target);
         temp = "";
-        commit();
+        note(target, "target");
         return;
       }
       // The entry exists under its real name from here, so it is reported before
       // the second name goes: a failure removing that one must not make a file
-      // that is on disk look like one that never arrived. It is also not
-      // suppressed — a leftover temp the caller never hears about is worse.
-      commit();
+      // that is on disk look like one that never arrived.
+      note(target, "target");
       const stray = temp;
       temp = "";
-      await unlink(stray);
+      // Not suppressed, and reported first: a leftover hard link holding the
+      // whole payload that the caller is never told about is worse than a noisy
+      // failure, and cleaning up by walking the report would miss it.
+      try {
+        await unlink(stray);
+      } catch (error) {
+        note(stray, "stray");
+        throw error;
+      }
     }
   } finally {
     // Closing may throw; the temp still has to go, and neither failure may
-    // replace the error that brought us here.
+    // replace the error that brought us here — but it is still reported, since
+    // the caller is the only one who can clean it up.
     await handle?.close().catch(() => {});
-    if (temp !== "") await unlink(temp).catch(() => {});
+    if (temp !== "") {
+      const stray = temp;
+      await unlink(stray).catch(() => note(stray, "stray"));
+    }
   }
 }
 
